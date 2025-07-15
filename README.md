@@ -62,3 +62,26 @@
 日志管理 - 详细的日志记录
 
 一键卸载 - 完整清理所有组件
+
+
+🚀 快速开始
+
+系统要求
+
+操作系统: Ubuntu/Debian/CentOS/RHEL
+
+Node.js: >= 16.0.0 (脚本自动安装)
+
+内存: >= 200MB
+
+磁盘: >= 100MB
+
+一键部署
+
+# 方式1: 直接运行
+curl -fsSL https://raw.githubusercontent.com/your-username/dler-bot/main/dler.sh | bash
+
+# 方式2: 下载后运行
+wget https://raw.githubusercontent.com/your-username/dler-bot/main/dler.sh
+chmod +x dler.sh
+./dler.sh
