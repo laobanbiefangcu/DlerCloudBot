@@ -166,5 +166,5 @@ tail -f logs/combined.log
 
 # 或完全重新开始
 ./uninstall.sh
-curl -fsSL https://raw.githubusercontent.com/your-username/dler-bot/main/dler.sh | bash
+curl -fsSL https://raw.githubusercontent.com/laobanbiefangcu/DlerCloudBot/main/dlerbot.sh | bash
 ```
