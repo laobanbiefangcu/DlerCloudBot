@@ -79,9 +79,11 @@ Node.js: >= 16.0.0 (脚本自动安装)
 一键部署
 
 # 方式1: 直接运行
-curl -fsSL https://raw.githubusercontent.com/your-username/dler-bot/main/dler.sh | bash
+```curl -fsSL https://raw.githubusercontent.com/laobanbiefangcu/DlerCloudBot/refs/heads/main/dlerbot.sh | bash```
 
 # 方式2: 下载后运行
-wget https://raw.githubusercontent.com/your-username/dler-bot/main/dler.sh
-chmod +x dler.sh
-./dler.sh
+```wget https://raw.githubusercontent.com/laobanbiefangcu/DlerCloudBot/refs/heads/main/dlerbot.sh
+chmod +x dlerbot.sh
+./dlerbot.sh```
+
+
