@@ -91,4 +91,32 @@ chmod +x dlerbot.sh
 ./dlerbot.sh
 ```
 
+配置机器人
 
+创建Telegram机器人
+
+在Telegram中搜索 @BotFather
+
+发送 /newbot 创建新机器人
+
+设置机器人名称和用户名
+
+复制获得的Token
+
+获取用户ID
+
+在Telegram中搜索 @userinfobot
+
+发送任意消息获取你的用户ID
+
+配置环境变量
+```bash
+nano .env
+```
+```bash
+# Telegram Bot Token
+BOT_TOKEN=your_bot_token_here
+
+# 管理员用户ID
+ADMIN_USER_ID=your_user_id_here
+```
