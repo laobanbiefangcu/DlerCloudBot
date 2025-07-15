@@ -80,13 +80,15 @@ Node.js: >= 16.0.0 (脚本自动安装)
 
 # 方式1: 直接运行
 ```bash
-curl -fsSL https://raw.githubusercontent.com/laobanbiefangcu/DlerCloudBot/refs/heads/main/dlerbot.sh | bash```
+curl -fsSL https://raw.githubusercontent.com/laobanbiefangcu/DlerCloudBot/refs/heads/main/dlerbot.sh | bash
+```
 
 
 # 方式2: 下载后运行
 ```bash
 wget https://raw.githubusercontent.com/laobanbiefangcu/DlerCloudBot/refs/heads/main/dlerbot.sh
 chmod +x dlerbot.sh
-./dlerbot.sh```
+./dlerbot.sh
+```
 
 
