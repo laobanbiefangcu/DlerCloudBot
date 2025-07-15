@@ -93,7 +93,7 @@ chmod +x dlerbot.sh
 
 配置机器人
 
-创建Telegram机器人
+1.创建Telegram机器人
 
 在Telegram中搜索 @BotFather
 
@@ -103,13 +103,14 @@ chmod +x dlerbot.sh
 
 复制获得的Token
 
-获取用户ID
+2.获取用户ID
 
 在Telegram中搜索 @userinfobot
 
 发送任意消息获取你的用户ID
 
-配置环境变量
+3.配置环境变量
+
 ```bash
 nano .env
 ```
@@ -119,4 +120,51 @@ BOT_TOKEN=your_bot_token_here
 
 # 管理员用户ID
 ADMIN_USER_ID=your_user_id_here
+```
+
+启动机器人
+```bash
+# 推荐：PM2后台启动
+./quick-start.sh
+
+# 或选择其他启动方式
+./start.sh
+```
+
+📊 监控和日志
+
+```bash
+# 检查系统状态
+./status.sh
+
+# PM2状态
+pm2 status
+
+# 系统服务状态
+sudo systemctl status dler-bot
+```
+
+查看日志
+```bash
+# PM2日志
+pm2 logs dler-bot
+
+# 系统日志
+sudo journalctl -u dler-bot -f
+
+# 文件日志
+tail -f logs/combined.log
+```
+
+重新部署
+```bash
+# 停止服务
+./stop.sh
+
+# 重新运行部署脚本
+./dler.sh
+
+# 或完全重新开始
+./uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/your-username/dler-bot/main/dler.sh | bash
 ```
