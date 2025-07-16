@@ -162,7 +162,7 @@ tail -f logs/combined.log
 ./stop.sh
 
 # 重新运行部署脚本
-./dler.sh
+./dlerbot.sh
 
 # 或完全重新开始
 ./uninstall.sh
