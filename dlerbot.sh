@@ -451,14 +451,31 @@ const getSystemStatus = async () => {
         // 测试墙洞API连接
         const apiStartTime = Date.now();
         try {
-            await axios.get('https://dler.cloud', { timeout: 5000 });
+            await axios.post('https://dler.cloud/api/v1/login', {
+                email: 'health-check@test.com',
+                passwd: 'test-health-check'
+            }, { 
+                timeout: 10000,
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
             var apiLatency = Date.now() - apiStartTime;
             var apiStatus = '✅ 正常';
-        } catch (e) {
+        } catch (apiError) {
             var apiLatency = Date.now() - apiStartTime;
-            var apiStatus = '❌ 异常';
-        }
-        
+            
+            // 如果是认证错误但返回了正确格式，说明API正常
+            if (apiError.response && apiError.response.data && 
+                typeof apiError.response.data.ret !== 'undefined') {
+                var apiStatus = '✅ 正常';
+            } else {
+                var apiStatus = '❌ 异常';
+            }
+        }      
+
+
+
         // 获取系统信息
         const uptime = process.uptime();
         const memUsage = process.memoryUsage();
