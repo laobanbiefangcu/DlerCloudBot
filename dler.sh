@@ -3,7 +3,7 @@
 # 墙洞API Telegram Bot 完整最终部署脚本
 # 作者: Dler Bot Team
 # 版本: v1.0.5 - 最终修复版
-# 使用方法: bash dlerbot.sh
+# 使用方法: bash dler.sh
 
 set -e
 
