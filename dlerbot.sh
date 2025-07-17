@@ -185,7 +185,7 @@ create_package_json() {
 cat > package.json << 'EOF'
 {
   "name": "dler-cloud-telegram-bot",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "墙洞API Telegram机器人 - 最终修复版",
   "main": "bot.js",
   "scripts": {
@@ -280,7 +280,7 @@ create_systemd_service() {
     
 cat > $SERVICE_FILE << EOF
 [Unit]
-Description=Dler Cloud Telegram Bot v1.0.4
+Description=Dler Cloud Telegram Bot v1.0.5
 After=network.target
 
 [Service]
@@ -314,6 +314,9 @@ create_bot_js_part1() {
 cat > bot.js << 'EOF'
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 // 配置
@@ -335,6 +338,210 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 // 存储用户token和会话信息
 let userTokens = {};
 let userSessions = {};
+let savedCredentials = {};
+
+// 文件路径
+const CREDENTIALS_FILE = path.join(__dirname, '.credentials');
+
+// 加密密钥 (在实际应用中应该使用环境变量)
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32);
+
+// 加密函数
+const encrypt = (text) => {
+    const algorithm = 'aes-256-cbc';
+    const key = Buffer.isBuffer(ENCRYPTION_KEY) ? ENCRYPTION_KEY : Buffer.from(ENCRYPTION_KEY, 'hex');
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipher(algorithm, key);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return iv.toString('hex') + ':' + encrypted;
+};
+
+// 解密函数
+const decrypt = (text) => {
+    try {
+        const algorithm = 'aes-256-cbc';
+        const key = Buffer.isBuffer(ENCRYPTION_KEY) ? ENCRYPTION_KEY : Buffer.from(ENCRYPTION_KEY, 'hex');
+        const textParts = text.split(':');
+        const iv = Buffer.from(textParts.shift(), 'hex');
+        const encryptedText = textParts.join(':');
+        const decipher = crypto.createDecipher(algorithm, key);
+        let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        return decrypted;
+    } catch (error) {
+        console.error('解密失败:', error.message);
+        return null;
+    }
+};
+
+// 保存凭据到文件
+const saveCredentials = (chatId, email, password) => {
+    try {
+        const credentials = {
+            email: encrypt(email),
+            password: encrypt(password),
+            savedAt: new Date().toISOString()
+        };
+        savedCredentials[chatId] = credentials;
+        fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(savedCredentials, null, 2));
+        return true;
+    } catch (error) {
+        console.error('保存凭据失败:', error.message);
+        return false;
+    }
+};
+
+// 从文件加载凭据
+const loadCredentials = () => {
+    try {
+        if (fs.existsSync(CREDENTIALS_FILE)) {
+            const data = fs.readFileSync(CREDENTIALS_FILE, 'utf8');
+            savedCredentials = JSON.parse(data);
+            console.log('✅ 已加载保存的凭据');
+        }
+    } catch (error) {
+        console.error('加载凭据失败:', error.message);
+        savedCredentials = {};
+    }
+};
+
+// 获取保存的凭据
+const getSavedCredentials = (chatId) => {
+    try {
+        const saved = savedCredentials[chatId];
+        if (saved) {
+            const email = decrypt(saved.email);
+            const password = decrypt(saved.password);
+            if (email && password) {
+                return { email, password };
+            }
+        }
+        return null;
+    } catch (error) {
+        console.error('获取凭据失败:', error.message);
+        return null;
+    }
+};
+
+// 删除保存的凭据
+const deleteSavedCredentials = (chatId) => {
+    try {
+        delete savedCredentials[chatId];
+        fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(savedCredentials, null, 2));
+        return true;
+    } catch (error) {
+        console.error('删除凭据失败:', error.message);
+        return false;
+    }
+};
+
+// 自动重新登录函数
+const autoRelogin = async (chatId) => {
+    try {
+        const credentials = getSavedCredentials(chatId);
+        if (!credentials) {
+            return false;
+        }
+        
+        console.log(`🔄 为用户 ${chatId} 执行自动重新登录...`);
+        
+        const response = await sendRequest('/login', {
+            email: credentials.email,
+            passwd: credentials.password,
+            token_expire: 30
+        });
+        
+        if (response.ret === 200) {
+            userTokens[chatId] = response.data.token;
+            userSessions[chatId] = {
+                email: credentials.email,
+                loginTime: new Date(),
+                plan: response.data.plan,
+                hasRememberedPassword: true,
+                autoRelogin: true
+            };
+            
+            console.log(`✅ 用户 ${chatId} 自动重新登录成功`);
+            
+            // 通知用户
+            bot.sendMessage(chatId, `🔄 检测到Token已过期，已自动重新登录\n\n📋 账户信息：\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}`);
+            
+            return true;
+        } else {
+            console.log(`❌ 用户 ${chatId} 自动重新登录失败: ${response.msg}`);
+            bot.sendMessage(chatId, `❌ 自动重新登录失败：${response.msg}\n\n请使用 /login 手动重新登录`);
+            return false;
+        }
+    } catch (error) {
+        console.error(`❌ 用户 ${chatId} 自动重新登录异常:`, error.message);
+        bot.sendMessage(chatId, '❌ 自动重新登录失败，请使用 /login 手动重新登录');
+        return false;
+    }
+};
+
+// 检查Token是否过期
+const checkTokenExpiry = async (chatId) => {
+    try {
+        const token = userTokens[chatId];
+        if (!token) {
+            return false;
+        }
+        
+        // 尝试一个简单的API调用来检查token是否有效
+        const response = await sendRequest('/information', { access_token: token });
+        
+        if (response.ret === 401 || response.ret === 403) {
+            // Token已过期
+            console.log(`⏰ 用户 ${chatId} 的Token已过期`);
+            delete userTokens[chatId];
+            
+            // 尝试自动重新登录
+            return await autoRelogin(chatId);
+        }
+        
+        return true;
+    } catch (error) {
+        // 如果是网络错误或其他错误，不处理
+        if (error.response && (error.response.status === 401 || error.response.status === 403)) {
+            console.log(`⏰ 用户 ${chatId} 的Token已过期`);
+            delete userTokens[chatId];
+            return await autoRelogin(chatId);
+        }
+        return true; // 其他错误不处理
+    }
+};
+
+// 中间件：检查登录状态和Token有效性
+const requireLogin = (callback) => {
+    return async (msg) => {
+        const chatId = msg.chat.id;
+        
+        // 首先检查是否有token
+        if (!userTokens[chatId]) {
+            // 尝试自动重新登录
+            const success = await autoRelogin(chatId);
+            if (!success) {
+                bot.sendMessage(chatId, '❌ 请先登录 /login');
+                return;
+            }
+        } else {
+            // 检查token是否过期
+            const valid = await checkTokenExpiry(chatId);
+            if (!valid) {
+                bot.sendMessage(chatId, '❌ 登录状态异常，请重试或手动重新登录 /login');
+                return;
+            }
+        }
+        
+        // 确保token存在后再执行回调
+        if (userTokens[chatId]) {
+            callback(msg);
+        } else {
+            bot.sendMessage(chatId, '❌ 登录状态异常，请使用 /login 重新登录');
+        }
+    };
+};
 
 // 工具函数：分段发送长消息
 const sendLongMessage = async (chatId, text, options = {}) => {
@@ -408,7 +615,7 @@ const sendRequest = async (endpoint, data) => {
             timeout: 15000,
             headers: {
                 'Content-Type': 'application/json',
-                'User-Agent': 'Dler-Bot/1.0.4'
+                'User-Agent': 'Dler-Bot/1.0.5'
             }
         });
         
@@ -493,7 +700,7 @@ const getSystemStatus = async () => {
             bot: {
                 uptime: Math.floor(uptime),
                 memory: Math.round(memUsage.rss / 1024 / 1024),
-                version: '1.0.4'
+                version: '1.0.5'
             }
         };
     } catch (error) {
@@ -508,7 +715,7 @@ const getSystemStatus = async () => {
             bot: {
                 uptime: Math.floor(process.uptime()),
                 memory: Math.round(process.memoryUsage().rss / 1024 / 1024),
-                version: '1.0.4'
+                version: '1.0.5'
             }
         };
     }
@@ -523,6 +730,7 @@ const setupBotMenu = async () => {
             { command: 'status', description: '📊 查看系统状态' },
             { command: 'login', description: '🔐 登录墙洞账户' },
             { command: 'logout', description: '🚪 注销登录' },
+            { command: 'creds', description: '🔑 密码管理' },
             { command: 'info', description: '📊 查看账户信息' },
             { command: 'checkin', description: '🎲 每日签到' },
             { command: 'sub', description: '📱 获取订阅链接' },
@@ -552,6 +760,7 @@ bot.onText(/\/start/, (msg) => {
 /status - 查看系统状态 🔍
 /login - 登录获取Token
 /logout - 注销登录
+/creds - 密码管理 🔑
 /info - 查看用户信息
 /checkin - 试试手气
 /sub - 获取所有订阅链接
@@ -642,6 +851,7 @@ bot.onText(/\/help/, (msg) => {
 🔐 账户相关：
 /login - 登录获取访问Token
 /logout - 登出并删除Token
+/creds - 密码管理和凭据查看
 /info - 查看账户信息和流量
 /checkin - 每日签到获取流量
 
@@ -660,21 +870,30 @@ bot.onText(/\/help/, (msg) => {
 - 系统状态: /status
 - 查看节点: /nodes
 - 登录: /login 然后输入 "邮箱 密码"
+- 密码管理: /creds 查看和管理保存的凭据
 - 添加规则: /addrule 1528 192.168.1.100 8080
 - 删除规则: /delrule 456
 
 📋 工作流程：
 1. /status - 检查系统状态
-2. /login - 登录账户
-3. /nodes - 查看节点信息
-4. /addrule - 添加转发规则
-5. /getrules - 查看已添加的规则
+2. /login - 登录账户（选择保存密码）
+3. /creds - 管理密码和查看凭据状态
+4. /nodes - 查看节点信息
+5. /addrule - 添加转发规则
+6. /getrules - 查看已添加的规则
+
+🔑 密码管理功能：
+• 加密保存登录凭据
+• 自动重新登录
+• 凭据状态查看
+• 安全测试和管理
 
 ⚡ 新功能：
 • 系统状态监控
 • 网络连接测试
 • API健康检查
 • 性能指标显示
+• 密码管理中心
 
 💡 提示：点击左下角菜单按钮可快速选择命令！
 `;
@@ -728,7 +947,51 @@ bot.onText(/\/login/, (msg) => {
                     plan: response.data.plan
                 };
                 
-                bot.sendMessage(chatId, `✅ 登录成功！\n\n📋 账户信息：\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}`);
+                const successMessage = `✅ 登录成功！\n\n📋 账户信息：\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}`;
+                
+                // 检查是否已保存凭据
+                const existingCreds = getSavedCredentials(chatId);
+                if (!existingCreds) {
+                    bot.sendMessage(chatId, successMessage + '\n\n🔑 是否保存密码以启用自动重新登录？\n\n回复 "保存" 启用自动登录\n回复 "跳过" 仅本次登录\n\n💡 保存后Token过期时将自动重新登录');
+                    
+                    // 等待用户选择是否保存密码
+                    const saveHandler = async (saveMsg) => {
+                        if (saveMsg.chat.id !== chatId) return;
+                        
+                        const choice = saveMsg.text.toLowerCase().trim();
+                        
+                        try {
+                            await bot.deleteMessage(chatId, saveMsg.message_id);
+                        } catch (e) {}
+                        
+                        if (choice === '保存') {
+                            if (saveCredentials(chatId, email, passwd)) {
+                                userSessions[chatId].hasRememberedPassword = true;
+                                bot.sendMessage(chatId, '✅ 密码已加密保存\n\n🔐 功能说明：\n• Token过期时自动重新登录\n• 使用AES-256-CBC加密存储\n• 可用 /creds 管理密码\n\n🛡️ 您的密码已安全加密，请放心使用');
+                            } else {
+                                bot.sendMessage(chatId, '❌ 保存密码失败，但登录已成功');
+                            }
+                        } else if (choice === '跳过') {
+                            bot.sendMessage(chatId, '✅ 已跳过密码保存\n\n💡 如需启用自动登录，请使用 /creds 管理密码或重新登录');
+                        } else {
+                            bot.sendMessage(chatId, '❌ 无效选择，已跳过密码保存\n\n💡 可以稍后使用 /creds 管理密码');
+                        }
+                        
+                        bot.removeListener('message', saveHandler);
+                    };
+                    
+                    bot.on('message', saveHandler);
+                    
+                    // 30秒后自动移除监听器
+                    setTimeout(() => {
+                        bot.removeListener('message', saveHandler);
+                    }, 30000);
+                } else {
+                    // 更新已保存的密码
+                    saveCredentials(chatId, email, passwd);
+                    userSessions[chatId].hasRememberedPassword = true;
+                    bot.sendMessage(chatId, successMessage + '\n\n🔑 已更新保存的密码');
+                }
             } else {
                 bot.sendMessage(chatId, `❌ 登录失败：${response.msg}`);
             }
@@ -762,13 +1025,158 @@ bot.onText(/\/logout/, async (msg) => {
     }
 });
 
-// 用户信息命令
-bot.onText(/\/info/, async (msg) => {
-    const token = userTokens[msg.chat.id];
-    if (!token) {
-        bot.sendMessage(msg.chat.id, '❌ 请先登录 /login');
+// 密码管理命令
+bot.onText(/\/creds/, (msg) => {
+    const chatId = msg.chat.id;
+    const saved = getSavedCredentials(chatId);
+    
+    let credsMessage = `🔑 密码管理中心\n\n`;
+    
+    if (saved) {
+        const maskedEmail = saved.email.replace(/(.{3}).*(@.*)/, '$1***$2');
+        const maskedPassword = '*'.repeat(saved.password.length);
+        
+        credsMessage += `📋 已保存凭据：\n`;
+        credsMessage += `• 邮箱: ${maskedEmail}\n`;
+        credsMessage += `• 密码: ${maskedPassword}\n`;
+        credsMessage += `• 状态: 🟢 已加密保存\n\n`;
+        
+        const session = userSessions[chatId];
+        if (session) {
+            const loginDuration = Math.floor((Date.now() - session.loginTime.getTime()) / 1000 / 60);
+            credsMessage += `🔐 当前会话：\n`;
+            credsMessage += `• 登录邮箱: ${session.email}\n`;
+            credsMessage += `• 登录时长: ${loginDuration}分钟\n`;
+            credsMessage += `• 自动登录: ${session.hasRememberedPassword ? '✅ 启用' : '❌ 禁用'}\n\n`;
+        }
+        
+        credsMessage += `⚙️ 管理选项：\n`;
+        credsMessage += `• 回复 "查看" - 显示明文凭据 ⚠️\n`;
+        credsMessage += `• 回复 "删除" - 删除保存的凭据\n`;
+        credsMessage += `• 回复 "测试" - 测试凭据有效性\n`;
+        credsMessage += `• 回复 "取消" - 退出密码管理\n\n`;
+        credsMessage += `🔒 安全提示：明文查看仅在私聊中可用`;
+    } else {
+        credsMessage += `📄 凭据状态：\n`;
+        credsMessage += `• 🔴 未保存任何凭据\n\n`;
+        credsMessage += `💡 使用说明：\n`;
+        credsMessage += `• 首次登录时选择"记住密码"\n`;
+        credsMessage += `• 或使用 /login 重新登录并保存\n\n`;
+        credsMessage += `🔐 安全特性：\n`;
+        credsMessage += `• AES-256-CBC 加密存储\n`;
+        credsMessage += `• 支持自动重新登录\n`;
+        credsMessage += `• 本地加密，安全可靠`;
+        
+        bot.sendMessage(chatId, credsMessage);
         return;
     }
+    
+    bot.sendMessage(chatId, credsMessage);
+    
+    // 等待用户选择
+    const optionHandler = async (optionMsg) => {
+        if (optionMsg.chat.id !== chatId) return;
+        
+        const option = optionMsg.text.toLowerCase().trim();
+        
+        try {
+            await bot.deleteMessage(chatId, optionMsg.message_id);
+        } catch (e) {}
+        
+        switch (option) {
+            case '查看':
+                if (msg.chat.type !== 'private') {
+                    bot.sendMessage(chatId, '⚠️ 为了安全，明文查看仅支持私聊');
+                    break;
+                }
+                const currentSavedForView = getSavedCredentials(chatId);
+                if (currentSavedForView) {
+                    const viewMessage = `🔍 凭据详情（明文）：\n\n• 邮箱: \`${currentSavedForView.email}\`\n• 密码: \`${currentSavedForView.password}\`\n\n⚠️ 请立即删除此消息`;
+                    const viewMsg = await bot.sendMessage(chatId, viewMessage, { parse_mode: 'Markdown' });
+                    
+                    // 30秒后自动删除
+                    setTimeout(async () => {
+                        try {
+                            await bot.deleteMessage(chatId, viewMsg.message_id);
+                            bot.sendMessage(chatId, '🗑️ 敏感信息已自动删除');
+                        } catch (e) {}
+                    }, 30000);
+                } else {
+                    bot.sendMessage(chatId, '❌ 未找到保存的凭据');
+                }
+                break;
+                
+            case '删除':
+                if (deleteSavedCredentials(chatId)) {
+                    delete userSessions[chatId];
+                    delete userTokens[chatId];
+                    bot.sendMessage(chatId, '✅ 已删除保存的凭据和当前会话\n\n💡 下次登录需要重新输入密码');
+                } else {
+                    bot.sendMessage(chatId, '❌ 删除凭据失败');
+                }
+                break;
+                
+            case '测试':
+                const currentSaved = getSavedCredentials(chatId);
+                if (currentSaved) {
+                    try {
+                        const testMsg = await bot.sendMessage(chatId, '🔄 正在测试凭据有效性...');
+                        
+                        const response = await sendRequest('/login', {
+                            email: currentSaved.email,
+                            passwd: currentSaved.password,
+                            token_expire: 30
+                        });
+                        
+                        try {
+                            await bot.deleteMessage(chatId, testMsg.message_id);
+                        } catch (e) {}
+                        
+                        if (response.ret === 200) {
+                            // 测试成功，更新当前存储的token
+                            userTokens[chatId] = response.data.token;
+                            userSessions[chatId] = {
+                                email: currentSaved.email,
+                                loginTime: new Date(),
+                                plan: response.data.plan,
+                                hasRememberedPassword: true
+                            };
+                            
+                            bot.sendMessage(chatId, '✅ 凭据测试成功\n\n• 邮箱和密码有效\n• 可以正常登录\n• 自动重新登录功能正常\n• 已更新登录状态');
+                        } else {
+                            bot.sendMessage(chatId, `❌ 凭据测试失败\n\n错误信息：${response.msg}\n\n💡 建议删除当前凭据并重新登录`);
+                        }
+                    } catch (error) {
+                        bot.sendMessage(chatId, '❌ 凭据测试失败，请检查网络连接');
+                    }
+                } else {
+                    bot.sendMessage(chatId, '❌ 未找到保存的凭据');
+                }
+                break;
+                
+            case '取消':
+                bot.sendMessage(chatId, '✅ 已退出密码管理');
+                break;
+                
+            default:
+                bot.sendMessage(chatId, '❌ 无效选项，请回复：查看、删除、测试、取消');
+                return; // 不移除监听器，等待有效输入
+        }
+        
+        bot.removeListener('message', optionHandler);
+    };
+    
+    bot.on('message', optionHandler);
+    
+    // 60秒后自动移除监听器
+    setTimeout(() => {
+        bot.removeListener('message', optionHandler);
+    }, 60000);
+});
+
+// 用户信息命令
+bot.onText(/\/info/, requireLogin(async (msg) => {
+    const token = userTokens[msg.chat.id];
     
     try {
         const response = await sendRequest('/information', { access_token: token });
@@ -778,7 +1186,8 @@ bot.onText(/\/info/, async (msg) => {
             
             if (session) {
                 const loginDuration = Math.floor((Date.now() - session.loginTime.getTime()) / 1000 / 60);
-                info += `\n🔐 会话信息：\n• 登录邮箱：${session.email}\n• 登录时长：${loginDuration}分钟`;
+                const passwordStatus = session.hasRememberedPassword ? '🔐 已保存，支持自动登录' : '🔒 未保存';
+                info += `\n🔐 会话信息：\n• 登录邮箱：${session.email}\n• 登录时长：${loginDuration}分钟\n• 密码状态：${passwordStatus}`;
             }
             
             bot.sendMessage(msg.chat.id, info);
@@ -788,15 +1197,11 @@ bot.onText(/\/info/, async (msg) => {
     } catch (error) {
         bot.sendMessage(msg.chat.id, '❌ 获取信息失败，请检查网络连接');
     }
-});
+}));
 
 // 签到命令
-bot.onText(/\/checkin/, async (msg) => {
+bot.onText(/\/checkin/, requireLogin(async (msg) => {
     const token = userTokens[msg.chat.id];
-    if (!token) {
-        bot.sendMessage(msg.chat.id, '❌ 请先登录 /login');
-        return;
-    }
     
     try {
         const response = await sendRequest('/checkin', { access_token: token });
@@ -809,15 +1214,11 @@ bot.onText(/\/checkin/, async (msg) => {
     } catch (error) {
         bot.sendMessage(msg.chat.id, '❌ 签到失败，请检查网络连接');
     }
-});
+}));
 
 // 订阅命令
-bot.onText(/\/sub/, async (msg) => {
+bot.onText(/\/sub/, requireLogin(async (msg) => {
     const token = userTokens[msg.chat.id];
-    if (!token) {
-        bot.sendMessage(msg.chat.id, '❌ 请先登录 /login');
-        return;
-    }
     
     try {
         const response = await sendRequest('/managed/clash', { access_token: token });
@@ -846,7 +1247,7 @@ bot.onText(/\/sub/, async (msg) => {
     } catch (error) {
         bot.sendMessage(msg.chat.id, '❌ 获取订阅失败，请检查网络连接');
     }
-});
+}));
 EOF
 }
 # 创建机器人主程序 - 第4部分（节点管理）
@@ -854,12 +1255,8 @@ create_bot_js_part4() {
 cat >> bot.js << 'EOF'
 
 // 优化的查看节点命令
-bot.onText(/\/nodes/, async (msg) => {
+bot.onText(/\/nodes/, requireLogin(async (msg) => {
     const token = userTokens[msg.chat.id];
-    if (!token) {
-        bot.sendMessage(msg.chat.id, '❌ 请先登录 /login');
-        return;
-    }
     
     try {
         const progressMsg = await bot.sendMessage(msg.chat.id, '🔍 正在获取节点信息...');
@@ -943,15 +1340,11 @@ bot.onText(/\/nodes/, async (msg) => {
         console.error('获取节点信息失败:', error);
         bot.sendMessage(msg.chat.id, '❌ 获取节点信息失败，请检查网络连接');
     }
-});
+}));
 
 // 查看转发规则
-bot.onText(/\/getrules/, requireAdmin(async (msg) => {
+bot.onText(/\/getrules/, requireLogin(async (msg) => {
     const token = userTokens[msg.chat.id];
-    if (!token) {
-        bot.sendMessage(msg.chat.id, '❌ 请先登录 /login');
-        return;
-    }
     
     try {
         const response = await sendRequest('/nodes/cusrelay/getrules', { access_token: token });
@@ -992,12 +1385,13 @@ create_bot_js_part5() {
 cat >> bot.js << 'EOF'
 
 // 添加转发规则 - 最终修复版本（使用字符串格式）
-bot.onText(/\/addrule/, requireAdmin(async (msg) => {
-    const token = userTokens[msg.chat.id];
-    if (!token) {
-        bot.sendMessage(msg.chat.id, '❌ 请先登录 /login');
+bot.onText(/\/addrule/, requireLogin(async (msg) => {
+    if (msg.from.id.toString() !== ADMIN_USER_ID) {
+        bot.sendMessage(msg.chat.id, '⚠️ 你没有权限使用此功能');
         return;
     }
+    
+    const token = userTokens[msg.chat.id];
     
     const text = msg.text.trim();
     const parts = text.split(' ');
@@ -1121,12 +1515,13 @@ bot.onText(/\/addrule/, requireAdmin(async (msg) => {
 }));
 
 // 删除转发规则
-bot.onText(/\/delrule/, requireAdmin(async (msg) => {
-    const token = userTokens[msg.chat.id];
-    if (!token) {
-        bot.sendMessage(msg.chat.id, '❌ 请先登录 /login');
+bot.onText(/\/delrule/, requireLogin(async (msg) => {
+    if (msg.from.id.toString() !== ADMIN_USER_ID) {
+        bot.sendMessage(msg.chat.id, '⚠️ 你没有权限使用此功能');
         return;
     }
+    
+    const token = userTokens[msg.chat.id];
     
     const text = msg.text.trim();
     const parts = text.split(' ');
@@ -1229,6 +1624,9 @@ process.on('SIGTERM', gracefulShutdown);
 // 启动机器人
 const startBot = async () => {
     try {
+        // 加载保存的凭据
+        loadCredentials();
+        
         await setupBotMenu();
         
         console.log('🤖 墙洞管理机器人已启动...');
@@ -1281,9 +1679,9 @@ create_start_scripts() {
 cat > start.sh << 'EOF'
 #!/bin/bash
 
-# 墙洞Bot启动脚本 v1.0.4
+# 墙洞Bot启动脚本 v1.0.5
 
-echo "🤖 墙洞Telegram Bot 启动脚本 v1.0.4"
+echo "🤖 墙洞Telegram Bot 启动脚本 v1.0.5"
 echo "========================================="
 
 # 检查配置
@@ -1579,9 +1977,9 @@ create_uninstall_script() {
 cat > uninstall.sh << 'EOF'
 #!/bin/bash
 
-# 墙洞Bot卸载脚本 v1.0.4
+# 墙洞Bot卸载脚本 v1.0.5
 
-echo "🗑️  墙洞API Telegram Bot 卸载脚本 v1.0.4"
+echo "🗑️  墙洞API Telegram Bot 卸载脚本 v1.0.5"
 echo "=============================================="
 
 # 颜色定义
@@ -1746,7 +2144,7 @@ echo "✅ 删除PM2配置"
 echo "✅ 删除systemd服务"
 echo "✅ 删除项目文件"
 echo ""
-log_info "感谢使用墙洞Telegram Bot v1.0.4！"
+log_info "感谢使用墙洞Telegram Bot v1.0.5！"
 EOF
     
     chmod +x uninstall.sh
@@ -1863,7 +2261,7 @@ show_completion_info() {
     echo ""
     
     echo "📁 生成的文件："
-    echo "├── bot.js            # 主程序 (v1.0.4)"
+    echo "├── bot.js            # 主程序 (v1.0.5)"
     echo "├── package.json      # 项目配置"  
     echo "├── .env              # 环境变量配置"
     echo "├── ecosystem.config.js # PM2配置"
@@ -1939,7 +2337,7 @@ main() {
 
 # 显示使用说明
 show_usage() {
-    echo "墙洞API Telegram Bot 完整最终部署脚本 v1.0.4"
+    echo "墙洞API Telegram Bot 完整最终部署脚本 v1.0.5"
     echo ""
     echo "使用方法:"
     echo "  curl -fsSL https://your-domain.com/complete_deploy.sh | bash"
@@ -1979,7 +2377,7 @@ show_version() {
     echo "作者: Dler Bot Team"
     echo "功能: 一键部署墙洞API Telegram管理机器人"
     echo ""
-    echo "🎯 v1.0.4 更新内容:"
+    echo "🎯 v1.0.5 更新内容:"
     echo "• 🔍 新增系统状态监控功能"
     echo "• 📊 新增网络和API健康检查"
     echo "• 🧪 新增测试模式和状态检查脚本"
