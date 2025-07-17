@@ -3,7 +3,7 @@
 # 墙洞API Telegram Bot 完整最终部署脚本
 # 作者: Dler Bot Team
 # 版本: v1.0.5 - 最终修复版
-# 使用方法: bash dler.sh
+# 使用方法: bash dlerbot.sh
 
 set -e
 
@@ -510,6 +510,53 @@ const checkTokenExpiry = async (chatId) => {
         }
         return true; // 其他错误不处理
     }
+};
+
+// 定时检测所有用户的Token状态
+const startTokenMonitoring = () => {
+    // 每30分钟检查一次所有用户的token状态
+    setInterval(async () => {
+        const activeUsers = Object.keys(userTokens);
+        if (activeUsers.length === 0) {
+            return;
+        }
+        
+        console.log(`⏰ 开始定时检测 ${activeUsers.length} 个用户的Token状态...`);
+        
+        for (const chatId of activeUsers) {
+            try {
+                const isValid = await checkTokenExpiry(chatId);
+                if (!isValid) {
+                    console.log(`⚠️ 用户 ${chatId} 的Token已过期并处理`);
+                } else {
+                    console.log(`✅ 用户 ${chatId} 的Token状态正常`);
+                }
+                
+                // 每个用户检查之间间隔1秒，避免API频率限制
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            } catch (error) {
+                console.error(`❌ 检测用户 ${chatId} Token状态时出错:`, error.message);
+            }
+        }
+        
+        console.log(`✅ 定时Token检测完成，下次检测时间: ${new Date(Date.now() + 30 * 60 * 1000).toLocaleString()}`);
+    }, 30 * 60 * 1000); // 30分钟 = 30 * 60 * 1000 毫秒
+    
+    // 启动时立即执行一次检测（延迟30秒，等待系统稳定）
+    setTimeout(async () => {
+        const activeUsers = Object.keys(userTokens);
+        if (activeUsers.length > 0) {
+            console.log(`🔍 启动后首次Token状态检测，共 ${activeUsers.length} 个用户`);
+            for (const chatId of activeUsers) {
+                try {
+                    await checkTokenExpiry(chatId);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                } catch (error) {
+                    console.error(`❌ 检测用户 ${chatId} Token状态时出错:`, error.message);
+                }
+            }
+        }
+    }, 30 * 1000); // 30秒后执行首次检测
 };
 
 // 中间件：检查登录状态和Token有效性
@@ -1644,6 +1691,10 @@ const startBot = async () => {
         } else {
             console.log('⚠️ 网络连接异常');
         }
+        
+        // 启动定时检测token功能
+        startTokenMonitoring();
+        console.log('⏰ 定时Token检测已启动 (每30分钟检查一次)');
         
     } catch (error) {
         console.error('❌ 启动失败:', error);
