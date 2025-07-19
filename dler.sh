@@ -3,7 +3,7 @@
 # 墙洞API Telegram Bot 完整最终部署脚本
 # 作者: Dler Bot Team
 # 版本: v1.0.5 - 最终修复版
-# 使用方法: bash dler.sh
+# 使用方法: bash dlersh
 
 set -e
 
@@ -492,14 +492,46 @@ const removeAccount = (chatId, accountId) => {
 const CREDENTIALS_FILE = path.join(__dirname, '.credentials');
 const TOKENS_FILE = path.join(__dirname, '.tokens');
 const SESSIONS_FILE = path.join(__dirname, '.sessions');
+const ENCRYPTION_KEY_FILE = path.join(__dirname, '.encryption_key');
 
-// 加密密钥 (在实际应用中应该使用环境变量)
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32);
+// 加密密钥管理函数
+const getOrCreateEncryptionKey = () => {
+    try {
+        // 优先使用环境变量
+        if (process.env.ENCRYPTION_KEY) {
+            console.log('✅ 使用环境变量中的加密密钥');
+            return process.env.ENCRYPTION_KEY;
+        }
+        
+        // 检查密钥文件是否存在
+        if (fs.existsSync(ENCRYPTION_KEY_FILE)) {
+            const savedKey = fs.readFileSync(ENCRYPTION_KEY_FILE, 'utf8').trim();
+            if (savedKey && savedKey.length === 64) {
+                console.log('✅ 从文件加载已保存的加密密钥');
+                return savedKey;
+            }
+        }
+        
+        // 生成新密钥并保存
+        const newKey = crypto.randomBytes(32).toString('hex');
+        fs.writeFileSync(ENCRYPTION_KEY_FILE, newKey);
+        console.log('✅ 生成并保存新的加密密钥');
+        return newKey;
+    } catch (error) {
+        console.error('❌ 加密密钥管理错误:', error.message);
+        // 如果出错，返回临时密钥（但不保存）
+        return crypto.randomBytes(32).toString('hex');
+    }
+};
+
+// 初始化加密密钥
+const ENCRYPTION_KEY = getOrCreateEncryptionKey();
 
 // 加密函数
 const encrypt = (text) => {
     const algorithm = 'aes-256-cbc';
-    const key = Buffer.isBuffer(ENCRYPTION_KEY) ? ENCRYPTION_KEY : Buffer.from(ENCRYPTION_KEY, 'hex');
+    // 确保密钥总是Buffer格式，长度为32字节
+    const key = Buffer.from(ENCRYPTION_KEY, 'hex');
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv(algorithm, key, iv);
     let encrypted = cipher.update(text, 'utf8', 'hex');
@@ -511,7 +543,8 @@ const encrypt = (text) => {
 const decrypt = (text) => {
     try {
         const algorithm = 'aes-256-cbc';
-        const key = Buffer.isBuffer(ENCRYPTION_KEY) ? ENCRYPTION_KEY : Buffer.from(ENCRYPTION_KEY, 'hex');
+        // 确保密钥总是Buffer格式，长度为32字节
+        const key = Buffer.from(ENCRYPTION_KEY, 'hex');
         const textParts = text.split(':');
         const iv = Buffer.from(textParts.shift(), 'hex');
         const encryptedText = textParts.join(':');
