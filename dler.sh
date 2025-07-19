@@ -3,9 +3,12 @@
 # 墙洞API Telegram Bot 完整最终部署脚本
 # 作者: Dler Bot Team
 # 版本: v1.0.5 - 最终修复版
-# 使用方法: bash dler.sh
+# 使用方法: bash dlerbot.sh
 
 set -e
+
+# 设置时区为中国标准时间
+export TZ=Asia/Shanghai
 
 echo "🚀 墙洞API Telegram Bot 完整最终部署脚本 v1.0.5"
 echo "======================================================"
@@ -133,10 +136,15 @@ install_nodejs() {
             curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
             sudo apt-get update
             sudo apt-get install -y nodejs
+            
+            # 基本系统依赖已通过Node.js安装完成
+            
         elif [[ $OS == "centos" ]]; then
             # CentOS/RHEL
             curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -
             sudo yum install -y nodejs
+            
+            # 基本系统依赖已通过Node.js安装完成
         fi
         
         log_info "Node.js安装完成: $(node --version)"
@@ -200,7 +208,7 @@ cat > package.json << 'EOF'
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.64.0",
-    "axios": "^1.6.0",
+    "undici": "^6.10.0",
     "dotenv": "^16.3.1"
   },
   "devDependencies": {
@@ -313,7 +321,8 @@ create_bot_js_part1() {
     
 cat > bot.js << 'EOF'
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
+const { request } = require('undici');
+const { createGunzip } = require('zlib');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -335,13 +344,154 @@ if (!BOT_TOKEN || !ADMIN_USER_ID) {
 // 创建bot实例
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// 存储用户token和会话信息
-let userTokens = {};
+// 存储用户会话信息 (token现在保存在文件中)
 let userSessions = {};
 let savedCredentials = {};
+let tokenFailureLog = []; // 记录token失效日志
+let tokenLastChecked = {}; // 记录每个用户token最后检查时间
+let userCookies = {}; // 存储用户的cookies
+let tokenRefreshTimers = {}; // 存储token刷新定时器
+
+// 多账号管理
+let userAccounts = {}; // 存储每个用户的多个账号 {chatId: {accountId: {email, token, ...}}}
+let currentAccount = {}; // 存储每个用户当前选中的账号 {chatId: accountId}
+
+
+
+
+// 多账号管理函数
+const generateAccountId = (email) => {
+    return email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+};
+
+const addAccount = (chatId, email, token, tokenExpire) => {
+    if (!userAccounts[chatId]) {
+        userAccounts[chatId] = {};
+    }
+    
+    const accountId = generateAccountId(email);
+    userAccounts[chatId][accountId] = {
+        email: email,
+        token: token,
+        tokenExpire: tokenExpire,
+        loginTime: Date.now(),
+        lastUsed: Date.now()
+    };
+    
+    // 如果是第一个账号，设为当前账号
+    if (!currentAccount[chatId]) {
+        currentAccount[chatId] = accountId;
+    }
+    
+    console.log(`✅ 为用户 ${chatId} 添加账号: ${email} (ID: ${accountId})`);
+    return accountId;
+};
+
+const getCurrentAccountInfo = (chatId) => {
+    const accountId = currentAccount[chatId];
+    if (!accountId || !userAccounts[chatId] || !userAccounts[chatId][accountId]) {
+        return null;
+    }
+    
+    // 从文件加载最新的token
+    const tokenData = loadTokenFromFile(chatId, accountId);
+    const accountInfo = {
+        accountId: accountId,
+        ...userAccounts[chatId][accountId]
+    };
+    
+    // 如果文件中有token，使用文件中的token
+    if (tokenData) {
+        accountInfo.token = tokenData.token;
+        accountInfo.tokenExpire = tokenData.tokenExpire;
+    }
+    
+    return accountInfo;
+};
+
+const switchAccount = (chatId, accountId) => {
+    if (!userAccounts[chatId] || !userAccounts[chatId][accountId]) {
+        return false;
+    }
+    
+    // 清理旧账号的Token刷新定时器
+    if (tokenRefreshTimers[chatId]) {
+        clearInterval(tokenRefreshTimers[chatId]);
+        delete tokenRefreshTimers[chatId];
+        console.log(`⏰ 清理用户 ${chatId} 的旧Token刷新定时器`);
+    }
+    
+    // 清理旧账号的Cookie
+    if (userCookies[chatId]) {
+        delete userCookies[chatId];
+        console.log(`🍪 清理用户 ${chatId} 的旧Cookie`);
+    }
+    
+    currentAccount[chatId] = accountId;
+    
+    // 保存token到文件
+    const account = userAccounts[chatId][accountId];
+    saveTokenToFile(chatId, accountId, {
+        token: account.token,
+        tokenExpire: account.tokenExpire,
+        email: account.email
+    });
+    updateUserSession(chatId, {
+        email: account.email,
+        loginTime: new Date(account.loginTime),
+        hasRememberedPassword: true,
+        autoRelogin: true
+    }, accountId);
+    
+    // 更新最后使用时间
+    userAccounts[chatId][accountId].lastUsed = Date.now();
+    
+    console.log(`🔄 用户 ${chatId} 切换到账号: ${account.email}`);
+    return true;
+};
+
+const getAccountList = (chatId) => {
+    if (!userAccounts[chatId]) {
+        return [];
+    }
+    return Object.keys(userAccounts[chatId]).map(accountId => ({
+        accountId,
+        ...userAccounts[chatId][accountId]
+    }));
+};
+
+const removeAccount = (chatId, accountId) => {
+    if (!userAccounts[chatId] || !userAccounts[chatId][accountId]) {
+        return false;
+    }
+    
+    const email = userAccounts[chatId][accountId].email;
+    delete userAccounts[chatId][accountId];
+    
+    // 同时删除该账号的凭证
+    deleteSavedCredentials(chatId, accountId);
+    
+    // 如果删除的是当前账号，切换到其他账号或清空
+    if (currentAccount[chatId] === accountId) {
+        const remainingAccounts = Object.keys(userAccounts[chatId]);
+        if (remainingAccounts.length > 0) {
+            switchAccount(chatId, remainingAccounts[0]);
+        } else {
+            delete currentAccount[chatId];
+            deleteTokenFromFile(chatId);
+            delete userSessions[chatId];
+        }
+    }
+    
+    console.log(`🗑️ 用户 ${chatId} 删除账号: ${email} (同时删除凭证)`);
+    return true;
+};
+
 
 // 文件路径
 const CREDENTIALS_FILE = path.join(__dirname, '.credentials');
+const TOKENS_FILE = path.join(__dirname, '.tokens');
+const SESSIONS_FILE = path.join(__dirname, '.sessions');
 
 // 加密密钥 (在实际应用中应该使用环境变量)
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32);
@@ -351,7 +501,7 @@ const encrypt = (text) => {
     const algorithm = 'aes-256-cbc';
     const key = Buffer.isBuffer(ENCRYPTION_KEY) ? ENCRYPTION_KEY : Buffer.from(ENCRYPTION_KEY, 'hex');
     const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipher(algorithm, key);
+    const cipher = crypto.createCipheriv(algorithm, key, iv);
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
     return iv.toString('hex') + ':' + encrypted;
@@ -365,7 +515,7 @@ const decrypt = (text) => {
         const textParts = text.split(':');
         const iv = Buffer.from(textParts.shift(), 'hex');
         const encryptedText = textParts.join(':');
-        const decipher = crypto.createDecipher(algorithm, key);
+        const decipher = crypto.createDecipheriv(algorithm, key, iv);
         let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
         decrypted += decipher.final('utf8');
         return decrypted;
@@ -375,16 +525,374 @@ const decrypt = (text) => {
     }
 };
 
-// 保存凭据到文件
+// ===== TOKEN文件存储功能 =====
+// 保存token到文件
+const saveTokenToFile = (chatId, accountId, tokenData) => {
+    try {
+        let tokens = {};
+        if (fs.existsSync(TOKENS_FILE)) {
+            const data = fs.readFileSync(TOKENS_FILE, 'utf8');
+            tokens = JSON.parse(data);
+        }
+        
+        if (!tokens[chatId]) {
+            tokens[chatId] = {};
+        }
+        
+        tokens[chatId][accountId] = {
+            token: tokenData.token,
+            tokenExpire: tokenData.tokenExpire,
+            email: tokenData.email,
+            savedAt: new Date().toISOString()
+        };
+        
+        fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
+        console.log(`✅ Token已保存到文件 - 用户: ${chatId}, 账号: ${accountId}`);
+        return true;
+    } catch (error) {
+        console.error('保存Token到文件失败:', error.message);
+        return false;
+    }
+};
+
+// 从文件加载token
+const loadTokenFromFile = (chatId, accountId) => {
+    try {
+        if (!fs.existsSync(TOKENS_FILE)) {
+            return null;
+        }
+        
+        const data = fs.readFileSync(TOKENS_FILE, 'utf8');
+        const tokens = JSON.parse(data);
+        
+        if (tokens[chatId] && tokens[chatId][accountId]) {
+            return tokens[chatId][accountId];
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('从文件加载Token失败:', error.message);
+        return null;
+    }
+};
+
+// 获取用户当前token
+const getUserToken = (chatId) => {
+    const currentAccountInfo = getCurrentAccountInfo(chatId);
+    if (!currentAccountInfo) {
+        return null;
+    }
+    
+    const tokenData = loadTokenFromFile(chatId, currentAccountInfo.accountId);
+    return tokenData ? tokenData.token : null;
+};
+
+// 从文件获取所有活跃用户列表
+const getActiveUsersFromFile = () => {
+    try {
+        if (!fs.existsSync(TOKENS_FILE)) {
+            return [];
+        }
+        
+        const data = fs.readFileSync(TOKENS_FILE, 'utf8');
+        const tokens = JSON.parse(data);
+        return Object.keys(tokens);
+    } catch (error) {
+        console.error('获取活跃用户列表失败:', error.message);
+        return [];
+    }
+};
+
+// 删除文件中的token
+const deleteTokenFromFile = (chatId, accountId = null) => {
+    try {
+        if (!fs.existsSync(TOKENS_FILE)) {
+            return true;
+        }
+        
+        const data = fs.readFileSync(TOKENS_FILE, 'utf8');
+        let tokens = JSON.parse(data);
+        
+        if (accountId) {
+            // 删除指定账号的token
+            if (tokens[chatId] && tokens[chatId][accountId]) {
+                delete tokens[chatId][accountId];
+                
+                // 如果用户没有其他账号了，删除整个用户记录
+                if (Object.keys(tokens[chatId]).length === 0) {
+                    delete tokens[chatId];
+                }
+            }
+        } else {
+            // 删除用户所有token
+            delete tokens[chatId];
+        }
+        
+        fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
+        console.log(`✅ Token已从文件删除 - 用户: ${chatId}${accountId ? `, 账号: ${accountId}` : ' (全部)'}`);
+        return true;
+    } catch (error) {
+        console.error('删除Token文件失败:', error.message);
+        return false;
+    }
+};
+
+// ===== SESSIONS文件存储功能 =====
+// 保存session到文件（支持多账号）
+const saveSessionToFile = (chatId, accountId, sessionData) => {
+    try {
+        let sessions = {};
+        if (fs.existsSync(SESSIONS_FILE)) {
+            const data = fs.readFileSync(SESSIONS_FILE, 'utf8');
+            sessions = JSON.parse(data);
+        }
+        
+        // 初始化用户sessions结构
+        if (!sessions[chatId]) {
+            sessions[chatId] = {
+                currentAccountId: null,
+                accounts: {}
+            };
+        }
+        
+        // 序列化Date对象为timestamp
+        const serializedSession = {
+            ...sessionData,
+            loginTime: sessionData.loginTime ? sessionData.loginTime.getTime() : Date.now()
+        };
+        
+        // 保存账号session数据
+        sessions[chatId].accounts[accountId] = serializedSession;
+        
+        // 更新当前活跃账号
+        sessions[chatId].currentAccountId = accountId;
+        
+        fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+        console.log(`✅ Session已保存到文件 - 用户: ${chatId}, 账号: ${accountId}`);
+        return true;
+    } catch (error) {
+        console.error('保存Session到文件失败:', error.message);
+        return false;
+    }
+};
+
+// 从文件加载session（支持多账号）
+const loadSessionFromFile = (chatId, accountId = null) => {
+    try {
+        if (!fs.existsSync(SESSIONS_FILE)) {
+            return null;
+        }
+        
+        const data = fs.readFileSync(SESSIONS_FILE, 'utf8');
+        const sessions = JSON.parse(data);
+        
+        if (sessions[chatId]) {
+            // 如果指定了accountId，返回特定账号的session
+            if (accountId && sessions[chatId].accounts && sessions[chatId].accounts[accountId]) {
+                const session = { ...sessions[chatId].accounts[accountId] };
+                if (session.loginTime) {
+                    session.loginTime = new Date(session.loginTime);
+                }
+                return session;
+            }
+            
+            // 如果没有指定accountId，返回当前活跃账号的session
+            const currentAccountId = sessions[chatId].currentAccountId;
+            if (currentAccountId && sessions[chatId].accounts && sessions[chatId].accounts[currentAccountId]) {
+                const session = { ...sessions[chatId].accounts[currentAccountId] };
+                if (session.loginTime) {
+                    session.loginTime = new Date(session.loginTime);
+                }
+                return session;
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('从文件加载Session失败:', error.message);
+        return null;
+    }
+};
+
+// 获取用户的当前活跃账号ID
+const getCurrentAccountIdFromFile = (chatId) => {
+    try {
+        if (!fs.existsSync(SESSIONS_FILE)) {
+            return null;
+        }
+        
+        const data = fs.readFileSync(SESSIONS_FILE, 'utf8');
+        const sessions = JSON.parse(data);
+        
+        return sessions[chatId] ? sessions[chatId].currentAccountId : null;
+    } catch (error) {
+        console.error('获取当前账号ID失败:', error.message);
+        return null;
+    }
+};
+
+// 删除文件中的session
+const deleteSessionFromFile = (chatId) => {
+    try {
+        if (!fs.existsSync(SESSIONS_FILE)) {
+            return true;
+        }
+        
+        const data = fs.readFileSync(SESSIONS_FILE, 'utf8');
+        let sessions = JSON.parse(data);
+        
+        delete sessions[chatId];
+        
+        fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+        console.log(`✅ Session已从文件删除 - 用户: ${chatId}`);
+        return true;
+    } catch (error) {
+        console.error('删除Session文件失败:', error.message);
+        return false;
+    }
+};
+
+// 启动时加载所有sessions
+const loadAllSessions = () => {
+    try {
+        if (!fs.existsSync(SESSIONS_FILE)) {
+            console.log('📄 未找到Sessions文件，从零开始');
+            return;
+        }
+        
+        const data = fs.readFileSync(SESSIONS_FILE, 'utf8');
+        const sessions = JSON.parse(data);
+        
+        let totalUsers = 0;
+        let totalSessions = 0;
+        
+        for (const chatId in sessions) {
+            totalUsers++;
+            const userSessionData = sessions[chatId];
+            
+            // 处理新格式（多账号）
+            if (userSessionData.accounts && userSessionData.currentAccountId) {
+                const currentAccountId = userSessionData.currentAccountId;
+                const currentSession = userSessionData.accounts[currentAccountId];
+                
+                if (currentSession) {
+                    // 加载当前活跃账号的session到内存
+                    userSessions[chatId] = {
+                        ...currentSession,
+                        loginTime: currentSession.loginTime ? new Date(currentSession.loginTime) : new Date()
+                    };
+                    
+                    // 更新currentAccount
+                    currentAccount[chatId] = currentAccountId;
+                }
+                
+                totalSessions += Object.keys(userSessionData.accounts).length;
+            }
+            // 处理旧格式（单账号） - 向后兼容
+            else if (userSessionData.email) {
+                userSessions[chatId] = {
+                    ...userSessionData,
+                    loginTime: userSessionData.loginTime ? new Date(userSessionData.loginTime) : new Date()
+                };
+                totalSessions++;
+            }
+        }
+        
+        console.log(`✅ 已从文件加载Sessions到内存 - 用户: ${totalUsers}个, 会话: ${totalSessions}个`);
+    } catch (error) {
+        console.error('加载Sessions文件失败:', error.message);
+    }
+};
+
+// 辅助函数：更新userSessions并保存到文件（支持多账号）
+const updateUserSession = (chatId, sessionData, accountId = null) => {
+    // 如果没有提供accountId，尝试从currentAccount获取
+    if (!accountId) {
+        accountId = currentAccount[chatId];
+    }
+    
+    // 如果仍然没有accountId，尝试从文件获取当前账号
+    if (!accountId) {
+        accountId = getCurrentAccountIdFromFile(chatId);
+    }
+    
+    // 如果还是没有accountId，创建一个默认的（这种情况很少见）
+    if (!accountId) {
+        console.warn(`警告: 用户 ${chatId} 没有活跃账号，使用默认账号ID`);
+        accountId = 'default';
+    }
+    
+    // 为了保持向后兼容，仍然更新内存中的userSessions（使用当前账号的数据）
+    if (!userSessions[chatId]) {
+        userSessions[chatId] = {};
+    }
+    Object.assign(userSessions[chatId], sessionData);
+    
+    // 保存到文件（支持多账号）
+    saveSessionToFile(chatId, accountId, sessionData);
+};
+
+// 启动时加载所有tokens到内存
+const loadAllTokens = () => {
+    try {
+        if (!fs.existsSync(TOKENS_FILE)) {
+            console.log('📄 未找到Token文件，从零开始');
+            return;
+        }
+        
+        const data = fs.readFileSync(TOKENS_FILE, 'utf8');
+        const tokens = JSON.parse(data);
+        
+        let totalUsers = 0;
+        let totalTokens = 0;
+        
+        // 将文件中的token数据加载到userAccounts
+        for (const chatId in tokens) {
+            totalUsers++;
+            if (!userAccounts[chatId]) {
+                userAccounts[chatId] = {};
+            }
+            
+            for (const accountId in tokens[chatId]) {
+                totalTokens++;
+                const tokenData = tokens[chatId][accountId];
+                
+                userAccounts[chatId][accountId] = {
+                    email: tokenData.email,
+                    token: tokenData.token,
+                    tokenExpire: tokenData.tokenExpire,
+                    lastUsed: Date.now(),
+                    loginTime: Date.now()
+                };
+            }
+        }
+        
+        console.log(`✅ 已从文件加载Token到内存 - 用户: ${totalUsers}个, Token: ${totalTokens}个`);
+    } catch (error) {
+        console.error('加载Token文件失败:', error.message);
+    }
+};
+
+// 保存凭据到文件（多账号模式）
 const saveCredentials = (chatId, email, password) => {
     try {
+        const accountId = generateAccountId(email);
+        
+        // 初始化用户凭证结构
+        if (!savedCredentials[chatId]) {
+            savedCredentials[chatId] = {};
+        }
+        
         const credentials = {
             email: encrypt(email),
             password: encrypt(password),
             savedAt: new Date().toISOString()
         };
-        savedCredentials[chatId] = credentials;
+        
+        savedCredentials[chatId][accountId] = credentials;
         fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(savedCredentials, null, 2));
+        
+        console.log(`✅ 为用户 ${chatId} 保存账号 ${email} 的凭证 (ID: ${accountId})`);
         return true;
     } catch (error) {
         console.error('保存凭据失败:', error.message);
@@ -406,17 +914,39 @@ const loadCredentials = () => {
     }
 };
 
-// 获取保存的凭据
-const getSavedCredentials = (chatId) => {
+// 获取保存的凭据（多账号模式）
+const getSavedCredentials = (chatId, accountId = null) => {
     try {
-        const saved = savedCredentials[chatId];
-        if (saved) {
-            const email = decrypt(saved.email);
-            const password = decrypt(saved.password);
-            if (email && password) {
-                return { email, password };
+        const userCredentials = savedCredentials[chatId];
+        if (!userCredentials) return null;
+        
+        // 如果指定了accountId，获取特定账号的凭证
+        if (accountId) {
+            const saved = userCredentials[accountId];
+            if (saved) {
+                const email = decrypt(saved.email);
+                const password = decrypt(saved.password);
+                if (email && password) {
+                    return { email, password, accountId };
+                }
+            }
+            return null;
+        }
+        
+        // 如果没有指定accountId，获取当前账号的凭证
+        const currentAccountInfo = getCurrentAccountInfo(chatId);
+        if (currentAccountInfo) {
+            const currentAccountId = currentAccountInfo.accountId;
+            const saved = userCredentials[currentAccountId];
+            if (saved) {
+                const email = decrypt(saved.email);
+                const password = decrypt(saved.password);
+                if (email && password) {
+                    return { email, password, accountId: currentAccountId };
+                }
             }
         }
+        
         return null;
     } catch (error) {
         console.error('获取凭据失败:', error.message);
@@ -424,11 +954,52 @@ const getSavedCredentials = (chatId) => {
     }
 };
 
-// 删除保存的凭据
-const deleteSavedCredentials = (chatId) => {
+// 获取用户所有保存的凭证
+const getAllSavedCredentials = (chatId) => {
     try {
-        delete savedCredentials[chatId];
+        const userCredentials = savedCredentials[chatId];
+        if (!userCredentials) return [];
+        
+        const result = [];
+        for (const [accountId, saved] of Object.entries(userCredentials)) {
+            const email = decrypt(saved.email);
+            const password = decrypt(saved.password);
+            if (email && password) {
+                result.push({
+                    accountId,
+                    email,
+                    password,
+                    savedAt: saved.savedAt
+                });
+            }
+        }
+        return result;
+    } catch (error) {
+        console.error('获取所有凭据失败:', error.message);
+        return [];
+    }
+};
+
+// 删除保存的凭据（多账号模式）
+const deleteSavedCredentials = (chatId, accountId = null) => {
+    try {
+        if (!savedCredentials[chatId]) return true;
+        
+        // 如果指定了accountId，删除特定账号的凭证
+        if (accountId) {
+            delete savedCredentials[chatId][accountId];
+            
+            // 如果用户没有任何凭证了，删除整个用户记录
+            if (Object.keys(savedCredentials[chatId]).length === 0) {
+                delete savedCredentials[chatId];
+            }
+        } else {
+            // 如果没有指定accountId，删除用户所有凭证
+            delete savedCredentials[chatId];
+        }
+        
         fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(savedCredentials, null, 2));
+        console.log(`✅ 删除用户 ${chatId} 的凭证${accountId ? ` (账号ID: ${accountId})` : ' (全部)'}`);
         return true;
     } catch (error) {
         console.error('删除凭据失败:', error.message);
@@ -436,46 +1007,130 @@ const deleteSavedCredentials = (chatId) => {
     }
 };
 
-// 自动重新登录函数
-const autoRelogin = async (chatId) => {
+// 自动重新登录函数（多账号模式）
+const autoRelogin = async (chatId, specificAccountId = null) => {
     try {
-        const credentials = getSavedCredentials(chatId);
-        if (!credentials) {
-            return false;
+        let credentials;
+        
+        // 如果指定了特定账号ID，为该账号重登录
+        if (specificAccountId) {
+            credentials = getSavedCredentials(chatId, specificAccountId);
+            if (!credentials) {
+                console.log(`❌ 用户 ${chatId} 账号 ${specificAccountId} 没有保存凭证`);
+                return false;
+            }
+        } else {
+            // 否则为当前账号重登录
+            credentials = getSavedCredentials(chatId);
+            if (!credentials) {
+                // 如果当前账号没有凭证，尝试为所有有凭证的账号重登录
+                const allCredentials = getAllSavedCredentials(chatId);
+                if (allCredentials.length === 0) {
+                    console.log(`❌ 用户 ${chatId} 没有保存任何凭证`);
+                    return false;
+                }
+                
+                // 为所有有凭证的账号尝试重登录
+                let successCount = 0;
+                for (const cred of allCredentials) {
+                    const success = await autoRelogin(chatId, cred.accountId);
+                    if (success) successCount++;
+                }
+                
+                if (successCount > 0) {
+                    console.log(`✅ 用户 ${chatId} 成功重登录 ${successCount}/${allCredentials.length} 个账号`);
+                    return true;
+                }
+                return false;
+            }
         }
         
-        console.log(`🔄 为用户 ${chatId} 执行自动重新登录...`);
+        console.log(`🔄 为用户 ${chatId} 执行自动重新登录 (账号: ${credentials.email})...`);
         
         const response = await sendRequest('/login', {
             email: credentials.email,
             passwd: credentials.password,
-            token_expire: 30
-        });
+            token_expire: 30,
+            save_cookie: true
+        }, null, chatId);
         
         if (response.ret === 200) {
-            userTokens[chatId] = response.data.token;
-            userSessions[chatId] = {
-                email: credentials.email,
-                loginTime: new Date(),
-                plan: response.data.plan,
-                hasRememberedPassword: true,
-                autoRelogin: true
-            };
+            // 获取正确的token字段（可能是token或access_token）
+            const token = response.data.token || response.data.access_token;
+            if (!token) {
+                console.error('❌ 自动重新登录响应中没有找到token或access_token字段');
+                return false;
+            }
             
-            console.log(`✅ 用户 ${chatId} 自动重新登录成功`);
+            // 计算token过期时间：使用服务端返回的token_expire或默认30天
+            let tokenExpiry;
+            if (response.data.token_expire && response.data.token_expire !== '9999-99-99 99:99:99') {
+                // 使用服务端返回的具体过期时间
+                tokenExpiry = new Date(response.data.token_expire).getTime();
+                if (DEBUG) {
+                    console.log('🕐 自动重登录使用服务端返回的token_expire:', response.data.token_expire);
+                }
+            } else {
+                // 服务端返回默认值，使用本地计算（30天）
+                tokenExpiry = Date.now() + (30 * 24 * 60 * 60 * 1000);
+                if (DEBUG) {
+                    console.log('🕐 自动重登录使用本地计算的token_expire: 30天');
+                }
+            }
             
-            // 通知用户
-            bot.sendMessage(chatId, `🔄 检测到Token已过期，已自动重新登录\n\n📋 账户信息：\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}`);
+            const accountId = credentials.accountId;
             
-            return true;
+            // 更新账号信息
+            if (userAccounts[chatId] && userAccounts[chatId][accountId]) {
+                userAccounts[chatId][accountId] = {
+                    ...userAccounts[chatId][accountId],
+                    token: token,
+                    tokenExpire: tokenExpiry,
+                    loginTime: Date.now(),
+                    lastUsed: Date.now()
+                };
+                
+                // 保存token到文件（所有账号都保存）
+                saveTokenToFile(chatId, accountId, {
+                    token: token,
+                    tokenExpire: tokenExpiry,
+                    email: userAccounts[chatId][accountId].email
+                });
+                    
+                    updateUserSession(chatId, {
+                        email: credentials.email,
+                        loginTime: new Date(),
+                        plan: response.data.plan,
+                        hasRememberedPassword: true
+                    }, accountId);
+                
+                console.log(`✅ 用户 ${chatId} 账号 ${credentials.email} 自动重新登录成功`);
+                
+                // 设置Token刷新定时器
+                setupTokenRefreshTimer(chatId);
+                
+                // 通知用户（仅当为当前账号重登录时）
+                if (!specificAccountId || currentAccount[chatId] === accountId) {
+                    bot.sendMessage(chatId, `🔄 检测到Token已过期，已自动重新登录\n\n📋 账户信息：\n• 邮箱：${credentials.email}\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}\n\n🔄 已启用Token自动刷新（每45分钟）`);
+                }
+                
+                return true;
+            } else {
+                console.log(`❌ 用户 ${chatId} 账号 ${accountId} 不存在于账号列表中`);
+                return false;
+            }
         } else {
-            console.log(`❌ 用户 ${chatId} 自动重新登录失败: ${response.msg}`);
-            bot.sendMessage(chatId, `❌ 自动重新登录失败：${response.msg}\n\n请使用 /login 手动重新登录`);
+            console.log(`❌ 用户 ${chatId} 账号 ${credentials.email} 自动重新登录失败: ${response.msg}`);
+            if (!specificAccountId) {
+                bot.sendMessage(chatId, `❌ 自动重新登录失败：${response.msg}\n\n请使用 /login 手动重新登录`);
+            }
             return false;
         }
     } catch (error) {
         console.error(`❌ 用户 ${chatId} 自动重新登录异常:`, error.message);
-        bot.sendMessage(chatId, '❌ 自动重新登录失败，请使用 /login 手动重新登录');
+        if (!specificAccountId) {
+            bot.sendMessage(chatId, '❌ 自动重新登录失败，请使用 /login 手动重新登录');
+        }
         return false;
     }
 };
@@ -483,40 +1138,181 @@ const autoRelogin = async (chatId) => {
 // 检查Token是否过期
 const checkTokenExpiry = async (chatId) => {
     try {
-        const token = userTokens[chatId];
-        if (!token) {
+        const currentAccount = getCurrentAccountInfo(chatId);
+        if (!currentAccount || !currentAccount.token) {
             return false;
+        }
+        const token = currentAccount.token;
+        
+        // 检查是否最近已经验证过（30分钟内不重复验证）
+        const lastChecked = tokenLastChecked[chatId];
+        const now = Date.now();
+        if (lastChecked && (now - lastChecked) < (30 * 60 * 1000)) {
+            console.log(`⏰ 用户 ${chatId} Token在30分钟内已验证，跳过检查`);
+            return true;
         }
         
         // 尝试一个简单的API调用来检查token是否有效
-        const response = await sendRequest('/information', { access_token: token });
+        const response = await sendRequest('/information', { access_token: currentAccount.token }, null, chatId);
+        
+        // 更新最后检查时间
+        tokenLastChecked[chatId] = now;
         
         if (response.ret === 401 || response.ret === 403) {
             // Token已过期
-            console.log(`⏰ 用户 ${chatId} 的Token已过期`);
-            delete userTokens[chatId];
+            const currentTime = new Date();
+            const expiredAt = tokenExpiryTimes[chatId] ? new Date(tokenExpiryTimes[chatId]) : null;
+            const actualDuration = expiredAt ? Math.floor((currentTime - (expiredAt.getTime() - 90 * 24 * 60 * 60 * 1000)) / (1000 * 60 * 60 * 24)) : 0;
             
-            // 尝试自动重新登录
-            return await autoRelogin(chatId);
+            // 记录失效日志
+            const logEntry = {
+                chatId: String(chatId), // 确保chatId是字符串类型
+                failureTime: currentTime,
+                expectedExpiry: expiredAt,
+                actualDuration: actualDuration,
+                reason: `API返回${response.ret}`,
+                timeToExpiry: expiredAt ? Math.floor((expiredAt - currentTime) / (1000 * 60 * 60)) : 0
+            };
+            
+            try {
+                tokenFailureLog.push(logEntry);
+                console.log(`📊 Token失效统计已记录 - 用户 ${chatId}, 当前记录数: ${tokenFailureLog.length}`);
+            } catch (pushError) {
+                console.error(`❌ Token失效统计记录失败:`, pushError);
+            }
+            
+            // 保持最近100条记录
+            if (tokenFailureLog.length > 100) {
+                tokenFailureLog.shift();
+            }
+            
+            console.log(`⏰ 用户 ${chatId} Token失效 - 实际使用${actualDuration}天, 距离预期过期${logEntry.timeToExpiry}小时, 原因: ${logEntry.reason}`);
+            deleteTokenFromFile(chatId);
+            delete userSessions[chatId];
+            delete tokenLastChecked[chatId]; // 清理检查缓存
+            // 清理持久化页面（已移除Puppeteer）
+            return false;
         }
         
-        return true;
+        return response.ret === 200;
     } catch (error) {
-        // 如果是网络错误或其他错误，不处理
+        // 如果是网络错误或其他错误，检查HTTP状态码
         if (error.response && (error.response.status === 401 || error.response.status === 403)) {
-            console.log(`⏰ 用户 ${chatId} 的Token已过期`);
-            delete userTokens[chatId];
-            return await autoRelogin(chatId);
+            const currentTime = new Date();
+            const expiredAt = tokenExpiryTimes[chatId] ? new Date(tokenExpiryTimes[chatId]) : null;
+            const actualDuration = expiredAt ? Math.floor((currentTime - (expiredAt.getTime() - 90 * 24 * 60 * 60 * 1000)) / (1000 * 60 * 60 * 24)) : 0;
+            
+            // 记录失效日志
+            const logEntry = {
+                chatId: String(chatId), // 确保chatId是字符串类型
+                failureTime: currentTime,
+                expectedExpiry: expiredAt,
+                actualDuration: actualDuration,
+                reason: `HTTP状态码${error.response.status}`,
+                timeToExpiry: expiredAt ? Math.floor((expiredAt - currentTime) / (1000 * 60 * 60)) : 0
+            };
+            
+            try {
+                tokenFailureLog.push(logEntry);
+                console.log(`📊 Token失效统计已记录 - 用户 ${chatId}, 当前记录数: ${tokenFailureLog.length}`);
+            } catch (pushError) {
+                console.error(`❌ Token失效统计记录失败:`, pushError);
+            }
+            
+            // 保持最近100条记录
+            if (tokenFailureLog.length > 100) {
+                tokenFailureLog.shift();
+            }
+            
+            console.log(`⏰ 用户 ${chatId} Token失效 - 实际使用${actualDuration}天, 距离预期过期${logEntry.timeToExpiry}小时, 原因: ${logEntry.reason}`);
+            deleteTokenFromFile(chatId);
+            delete userSessions[chatId];
+            delete tokenLastChecked[chatId]; // 清理检查缓存
+            // 清理持久化页面（已移除Puppeteer）
+            return false;
         }
-        return true; // 其他错误不处理
+        console.error(`❌ 检查Token过期异常:`, error.message);
+        return false; // 网络错误等情况返回false，触发重新登录
     }
+};
+
+// 主动刷新Token（每45分钟刷新一次，避免1小时过期）
+const refreshUserToken = async (chatId) => {
+    try {
+        const credentials = getSavedCredentials(chatId);
+        if (!credentials) {
+            console.log(`⚠️ 用户 ${chatId} 无保存凭据，跳过Token刷新`);
+            return false;
+        }
+        
+        console.log(`🔄 主动刷新用户 ${chatId} 的Token...`);
+        
+        // 使用保存的凭据重新登录
+        const response = await sendRequest('/login', {
+            email: credentials.email,
+            passwd: credentials.password,
+            token_expire: 30,
+            save_cookie: true
+        }, null, chatId);
+        
+        if (response.ret === 200) {
+            // 获取正确的token字段（可能是token或access_token）
+            const token = response.data.token || response.data.access_token;
+            if (!token) {
+                console.error('❌ Token刷新响应中没有找到token或access_token字段');
+                return false;
+            }
+            
+            // 更新token和相关信息
+            const accountId = credentials.accountId || `${chatId}_${Date.now()}`;
+            
+            if (userAccounts[chatId] && userAccounts[chatId][accountId]) {
+                userAccounts[chatId][accountId].token = token;
+                userAccounts[chatId][accountId].lastUsed = Date.now();
+                
+                if (currentAccount[chatId] === accountId) {
+                    saveTokenToFile(chatId, accountId, {
+                        token: token,
+                        tokenExpire: userAccounts[chatId][accountId].tokenExpire,
+                        email: userAccounts[chatId][accountId].email
+                    });
+                    updateUserSession(chatId, { token: token }, accountId);
+                }
+            }
+            
+            console.log(`✅ 用户 ${chatId} Token刷新成功`);
+            return true;
+        } else {
+            console.log(`❌ 用户 ${chatId} Token刷新失败: ${response.msg}`);
+            return false;
+        }
+    } catch (error) {
+        console.error(`❌ 用户 ${chatId} Token刷新异常:`, error.message);
+        return false;
+    }
+};
+
+// 设置Token刷新定时器
+const setupTokenRefreshTimer = (chatId) => {
+    // 清除已存在的定时器
+    if (tokenRefreshTimers[chatId]) {
+        clearInterval(tokenRefreshTimers[chatId]);
+    }
+    
+    // 每45分钟刷新一次Token
+    tokenRefreshTimers[chatId] = setInterval(async () => {
+        console.log(`⏰ 定时刷新用户 ${chatId} 的Token`);
+        await refreshUserToken(chatId);
+    }, 45 * 60 * 1000); // 45分钟
+    
+    console.log(`⏰ 已设置用户 ${chatId} 的Token定时刷新（每45分钟）`);
 };
 
 // 定时检测所有用户的Token状态
 const startTokenMonitoring = () => {
-    // 每30分钟检查一次所有用户的token状态
+    // 每60分钟检查一次所有用户的token状态
     setInterval(async () => {
-        const activeUsers = Object.keys(userTokens);
+        const activeUsers = getActiveUsersFromFile();
         if (activeUsers.length === 0) {
             return;
         }
@@ -525,32 +1321,57 @@ const startTokenMonitoring = () => {
         
         for (const chatId of activeUsers) {
             try {
-                const isValid = await checkTokenExpiry(chatId);
-                if (!isValid) {
-                    console.log(`⚠️ 用户 ${chatId} 的Token已过期并处理`);
+                const tokenExpiry = tokenExpiryTimes[chatId];
+                const now = Date.now();
+                
+                // 如果token在6小时内过期，提前刷新
+                if (tokenExpiry && (tokenExpiry - now) < (6 * 60 * 60 * 1000)) {
+                    console.log(`⏰ 用户 ${chatId} Token将在6小时内过期，开始提前刷新...`);
+                    
+                    const success = await autoRelogin(chatId);
+                    if (success) {
+                        console.log(`✅ 用户 ${chatId} Token提前刷新成功`);
+                    } else {
+                        console.log(`❌ 用户 ${chatId} Token提前刷新失败`);
+                    }
                 } else {
-                    console.log(`✅ 用户 ${chatId} 的Token状态正常`);
+                    // 常规检查token有效性
+                    const isValid = await checkTokenExpiry(chatId);
+                    if (!isValid) {
+                        console.log(`⚠️ 用户 ${chatId} 的Token已过期，尝试自动重新登录...`);
+                        console.log(`📊 当前Token失效统计记录数: ${tokenFailureLog.length}`);
+                        const success = await autoRelogin(chatId);
+                        if (success) {
+                            console.log(`✅ 用户 ${chatId} 自动重新登录成功`);
+                        } else {
+                            console.log(`❌ 用户 ${chatId} 自动重新登录失败`);
+                        }
+                    } else {
+                        console.log(`✅ 用户 ${chatId} 的Token状态正常`);
+                    }
                 }
                 
-                // 每个用户检查之间间隔1秒，避免API频率限制
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                // 每个用户检查之间间隔2-5秒随机延迟，避免API频率限制
+                const randomDelay = Math.floor(Math.random() * 3000) + 2000; // 2-5秒随机延迟
+                await new Promise(resolve => setTimeout(resolve, randomDelay));
             } catch (error) {
                 console.error(`❌ 检测用户 ${chatId} Token状态时出错:`, error.message);
             }
         }
         
-        console.log(`✅ 定时Token检测完成，下次检测时间: ${new Date(Date.now() + 30 * 60 * 1000).toLocaleString()}`);
-    }, 30 * 60 * 1000); // 30分钟 = 30 * 60 * 1000 毫秒
+        console.log(`✅ 定时Token检测完成，下次检测时间: ${new Date(Date.now() + 60 * 60 * 1000).toLocaleString()}`);
+    }, 60 * 60 * 1000); // 60分钟 = 60 * 60 * 1000 毫秒
     
     // 启动时立即执行一次检测（延迟30秒，等待系统稳定）
     setTimeout(async () => {
-        const activeUsers = Object.keys(userTokens);
+        const activeUsers = getActiveUsersFromFile();
         if (activeUsers.length > 0) {
             console.log(`🔍 启动后首次Token状态检测，共 ${activeUsers.length} 个用户`);
             for (const chatId of activeUsers) {
                 try {
                     await checkTokenExpiry(chatId);
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    const randomDelay = Math.floor(Math.random() * 3000) + 2000; // 2-5秒随机延迟
+                    await new Promise(resolve => setTimeout(resolve, randomDelay));
                 } catch (error) {
                     console.error(`❌ 检测用户 ${chatId} Token状态时出错:`, error.message);
                 }
@@ -564,25 +1385,31 @@ const requireLogin = (callback) => {
     return async (msg) => {
         const chatId = msg.chat.id;
         
-        // 首先检查是否有token
-        if (!userTokens[chatId]) {
+        // 首先检查是否有当前账号
+        const currentAccount = getCurrentAccountInfo(chatId);
+        if (!currentAccount) {
             // 尝试自动重新登录
             const success = await autoRelogin(chatId);
             if (!success) {
-                bot.sendMessage(chatId, '❌ 请先登录 /login');
+                bot.sendMessage(chatId, '❌ 请先登录 /login\n💡 如需管理多个账号，可登录多次');
                 return;
             }
         } else {
             // 检查token是否过期
             const valid = await checkTokenExpiry(chatId);
             if (!valid) {
-                bot.sendMessage(chatId, '❌ 登录状态异常，请重试或手动重新登录 /login');
-                return;
+                // token过期，尝试自动重新登录
+                const success = await autoRelogin(chatId);
+                if (!success) {
+                    bot.sendMessage(chatId, '❌ Token已过期，自动重新登录失败，请手动重新登录 /login');
+                    return;
+                }
             }
         }
         
-        // 确保token存在后再执行回调
-        if (userTokens[chatId]) {
+        // 确保当前账号存在后再执行回调
+        const finalAccount = getCurrentAccountInfo(chatId);
+        if (finalAccount && finalAccount.token) {
             callback(msg);
         } else {
             bot.sendMessage(chatId, '❌ 登录状态异常，请使用 /login 重新登录');
@@ -650,34 +1477,87 @@ const requireAdmin = (callback) => {
     };
 };
 
-// 工具函数：发送HTTP请求
-const sendRequest = async (endpoint, data) => {
+// 发送API请求（使用undici）
+const sendRequest = async (endpoint, data, token = null, chatId = null) => {
     try {
         if (DEBUG) {
             console.log(`📤 API请求: ${DLER_BASE_URL}${endpoint}`);
             console.log('📋 请求数据:', JSON.stringify(data, null, 2));
         }
         
-        const response = await axios.post(`${DLER_BASE_URL}${endpoint}`, data, {
-            timeout: 15000,
-            headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': 'Dler-Bot/1.0.5'
-            }
-        });
+        const headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'Referer': 'https://dler.cloud/',
+            'Origin': 'https://dler.cloud',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'DNT': '1',
+            'Sec-CH-UA': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'Sec-CH-UA-Mobile': '?0',
+            'Sec-CH-UA-Platform': '"Windows"'
+        };
         
-        if (DEBUG) {
-            console.log('📥 API响应:', JSON.stringify(response.data, null, 2));
+        // 如果有Cookie，添加Cookie头
+        if (chatId && userCookies[chatId]) {
+            headers['Cookie'] = userCookies[chatId];
         }
         
-        return response.data;
+        const response = await request(`${DLER_BASE_URL}${endpoint}`, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify(data)
+        });
+        
+        // 正确处理响应体，包括gzip解压
+        let responseText;
+        if (response.headers['content-encoding'] === 'gzip') {
+            const chunks = [];
+            const gunzip = createGunzip();
+            
+            response.body.pipe(gunzip);
+            
+            for await (const chunk of gunzip) {
+                chunks.push(chunk);
+            }
+            
+            responseText = Buffer.concat(chunks).toString();
+        } else {
+            responseText = await response.body.text();
+        }
+        
+        const responseData = JSON.parse(responseText);
+        
+        // 保存Cookie（如果是登录请求）
+        if (endpoint === '/login' && response.headers['set-cookie'] && chatId) {
+            const cookies = response.headers['set-cookie'];
+            if (Array.isArray(cookies)) {
+                userCookies[chatId] = cookies.join('; ');
+            } else {
+                userCookies[chatId] = cookies;
+            }
+            console.log(`🍪 保存用户 ${chatId} 的Cookie`);
+        }
+        
+        if (DEBUG) {
+            console.log('📥 API响应:', JSON.stringify(responseData, null, 2));
+        }
+        
+        return responseData;
     } catch (error) {
         console.error('❌ API请求失败:');
         console.error('URL:', `${DLER_BASE_URL}${endpoint}`);
         if (DEBUG) {
             console.error('Data:', JSON.stringify(data, null, 2));
         }
-        console.error('Error:', error.response?.data || error.message);
+        console.error('Error:', error.message);
         throw error;
     }
 };
@@ -698,21 +1578,51 @@ const getSystemStatus = async () => {
     try {
         const startTime = Date.now();
         
-        // 测试网络连接
-        const networkTest = await axios.get('https://httpbin.org/ip', { timeout: 5000 });
+        // 测试网络连接 - 使用更可靠的服务
+        const networkTest = await request('https://api.ipify.org?format=json', {
+            method: 'GET',
+            headersTimeout: 5000,
+            bodyTimeout: 5000
+        });
+        let networkText;
+        if (networkTest.headers['content-encoding'] === 'gzip') {
+            const chunks = [];
+            const gunzip = createGunzip();
+            
+            networkTest.body.pipe(gunzip);
+            
+            for await (const chunk of gunzip) {
+                chunks.push(chunk);
+            }
+            
+            networkText = Buffer.concat(chunks).toString();
+        } else {
+            networkText = await networkTest.body.text();
+        }
+        
+        let networkData;
+        try {
+            networkData = JSON.parse(networkText);
+        } catch (parseError) {
+            console.error('网络测试响应解析失败:', networkText.substring(0, 100));
+            throw new Error('网络测试返回非JSON响应');
+        }
         const networkLatency = Date.now() - startTime;
         
         // 测试墙洞API连接
         const apiStartTime = Date.now();
         try {
-            await axios.post('https://dler.cloud/api/v1/login', {
-                email: 'health-check@test.com',
-                passwd: 'test-health-check'
-            }, { 
-                timeout: 10000,
+            await request('https://dler.cloud/api/v1/login', {
+                method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
-                }
+                },
+                body: JSON.stringify({
+                    email: 'health-check@test.com',
+                    passwd: 'test-health-check'
+                }),
+                headersTimeout: 10000,
+                bodyTimeout: 10000
             });
             var apiLatency = Date.now() - apiStartTime;
             var apiStatus = '✅ 正常';
@@ -720,8 +1630,7 @@ const getSystemStatus = async () => {
             var apiLatency = Date.now() - apiStartTime;
             
             // 如果是认证错误但返回了正确格式，说明API正常
-            if (apiError.response && apiError.response.data && 
-                typeof apiError.response.data.ret !== 'undefined') {
+            if (apiError.statusCode && (apiError.statusCode === 400 || apiError.statusCode === 401)) {
                 var apiStatus = '✅ 正常';
             } else {
                 var apiStatus = '❌ 异常';
@@ -738,7 +1647,7 @@ const getSystemStatus = async () => {
             network: {
                 status: '✅ 正常',
                 latency: networkLatency,
-                ip: networkTest.data.origin
+                ip: networkData.ip || networkData.origin || '未知'
             },
             api: {
                 status: apiStatus,
@@ -776,8 +1685,13 @@ const setupBotMenu = async () => {
             { command: 'help', description: '📖 查看帮助信息' },
             { command: 'status', description: '📊 查看系统状态' },
             { command: 'login', description: '🔐 登录墙洞账户' },
-            { command: 'logout', description: '🚪 注销登录' },
+            { command: 'logout', description: '🚪 注销当前账号' },
+            { command: 'accounts', description: '👥 查看所有账号' },
+            { command: 'switch', description: '🔄 切换账号' },
+            { command: 'current', description: '📍 查看当前账号' },
+            { command: 'remove', description: '🗑️ 删除账号' },
             { command: 'creds', description: '🔑 密码管理' },
+            { command: 'tokenstats', description: '📊 Token失效统计' },
             { command: 'info', description: '📊 查看账户信息' },
             { command: 'checkin', description: '🎲 每日签到' },
             { command: 'sub', description: '📱 获取订阅链接' },
@@ -807,7 +1721,12 @@ bot.onText(/\/start/, (msg) => {
 /status - 查看系统状态 🔍
 /login - 登录获取Token
 /logout - 注销登录
+/accounts - 查看所有账号 👥
+/switch - 切换账号 🔄
+/current - 查看当前账号 📍
+/remove - 删除账号 🗑️
 /creds - 密码管理 🔑
+/tokenstats - Token失效统计 📊
 /info - 查看用户信息
 /checkin - 试试手气
 /sub - 获取所有订阅链接
@@ -861,7 +1780,7 @@ bot.onText(/\/status/, async (msg) => {
         statusMsg += `• 版本: v${status.bot.version}\n`;
         statusMsg += `• 运行时间: ${Math.floor(status.bot.uptime / 3600)}小时${Math.floor((status.bot.uptime % 3600) / 60)}分钟\n`;
         statusMsg += `• 内存使用: ${status.bot.memory}MB\n`;
-        statusMsg += `• 用户会话: ${Object.keys(userTokens).length}个\n\n`;
+        statusMsg += `• 用户会话: ${getActiveUsersFromFile().length}个\n\n`;
         
         // 功能状态
         statusMsg += `⚙️ 功能模块:\n`;
@@ -899,6 +1818,7 @@ bot.onText(/\/help/, (msg) => {
 /login - 登录获取访问Token
 /logout - 登出并删除Token
 /creds - 密码管理和凭据查看
+/tokenstats - Token失效统计和分析
 /info - 查看账户信息和流量
 /checkin - 每日签到获取流量
 
@@ -977,27 +1897,71 @@ bot.onText(/\/login/, (msg) => {
             const progressMsg = await bot.sendMessage(chatId, '🔄 正在登录...');
             
             const response = await sendRequest('/login', {
-                email,
-                passwd,
-                token_expire: 30
-            });
+                email: email,
+                passwd: passwd,
+                token_expire: 30,
+                save_cookie: true
+            }, null, chatId);
             
             try {
                 await bot.deleteMessage(chatId, progressMsg.message_id);
             } catch (e) {}
             
             if (response.ret === 200) {
-                userTokens[chatId] = response.data.token;
-                userSessions[chatId] = {
+                // 调试：打印登录响应数据
+                console.log(`🔍 登录响应数据:`, JSON.stringify(response.data));
+                
+                // 获取正确的token字段（可能是token或access_token）
+                const token = response.data.token || response.data.access_token;
+                if (!token) {
+                    console.error('❌ 登录响应中没有找到token或access_token字段');
+                    bot.sendMessage(chatId, '❌ 登录失败：服务器响应格式错误，未返回token');
+                    bot.removeListener('message', messageHandler);
+                    return;
+                }
+                
+                // 计算token过期时间：使用服务端返回的token_expire或默认30天
+                let tokenExpiry;
+                if (response.data.token_expire && response.data.token_expire !== '9999-99-99 99:99:99') {
+                    // 使用服务端返回的具体过期时间
+                    tokenExpiry = new Date(response.data.token_expire).getTime();
+                    if (DEBUG) {
+                        console.log('🕐 使用服务端返回的token_expire:', response.data.token_expire);
+                    }
+                } else {
+                    // 服务端返回默认值，使用本地计算（30天）
+                    tokenExpiry = Date.now() + (30 * 24 * 60 * 60 * 1000);
+                    if (DEBUG) {
+                        console.log('🕐 使用本地计算的token_expire: 30天');
+                    }
+                }
+                
+                // 使用多账号系统添加账号
+                const accountInfo = {
                     email: email,
-                    loginTime: new Date(),
-                    plan: response.data.plan
+                    plan: response.data.plan,
+                    planTime: response.data.plan_time,
+                    money: response.data.money,
+                    upload: response.data.upload,
+                    download: response.data.download,
+                    transfer: response.data.transfer,
+                    usage: response.data.usage
                 };
                 
-                const successMessage = `✅ 登录成功！\n\n📋 账户信息：\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}`;
+                const accountId = addAccount(chatId, email, token, tokenExpiry);
                 
-                // 检查是否已保存凭据
-                const existingCreds = getSavedCredentials(chatId);
+                // 初始化userSessions以保持兼容性
+                updateUserSession(chatId, {
+                    email: email,
+                    loginTime: new Date(),
+                    plan: response.data.plan,
+                    hasRememberedPassword: false
+                }, accountId);
+                
+                const successMessage = `✅ 登录成功！\n\n📋 账户信息：\n• 账号ID：${accountId}\n• 邮箱：${email}\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}\n\n💡 使用 /accounts 查看所有账号\n💡 使用 /switch ${accountId} 切换账号`;
+                
+                // 检查当前登录的账号是否已保存凭据
+                const existingCreds = getSavedCredentials(chatId, accountId);
                 if (!existingCreds) {
                     bot.sendMessage(chatId, successMessage + '\n\n🔑 是否保存密码以启用自动重新登录？\n\n回复 "保存" 启用自动登录\n回复 "跳过" 仅本次登录\n\n💡 保存后Token过期时将自动重新登录');
                     
@@ -1013,8 +1977,19 @@ bot.onText(/\/login/, (msg) => {
                         
                         if (choice === '保存') {
                             if (saveCredentials(chatId, email, passwd)) {
-                                userSessions[chatId].hasRememberedPassword = true;
-                                bot.sendMessage(chatId, '✅ 密码已加密保存\n\n🔐 功能说明：\n• Token过期时自动重新登录\n• 使用AES-256-CBC加密存储\n• 可用 /creds 管理密码\n\n🛡️ 您的密码已安全加密，请放心使用');
+                                try {
+                                    updateUserSession(chatId, {
+                                        hasRememberedPassword: true
+                                    }, accountId);
+                                    // 设置Token刷新定时器
+                                    setupTokenRefreshTimer(chatId);
+                                    bot.sendMessage(chatId, '✅ 密码已加密保存\n\n🔐 功能说明：\n• Token过期时自动重新登录\n• 使用AES-256-CBC加密存储\n• 可用 /creds 管理密码\n• 每45分钟自动刷新Token\n\n🛡️ 您的密码已安全加密，请放心使用');
+                                } catch (error) {
+                                    console.error('设置hasRememberedPassword失败:', error);
+                                    // 设置Token刷新定时器
+                                    setupTokenRefreshTimer(chatId);
+                                    bot.sendMessage(chatId, '✅ 密码已加密保存\n\n🔐 功能说明：\n• Token过期时自动重新登录\n• 使用AES-256-CBC加密存储\n• 可用 /creds 管理密码\n• 每45分钟自动刷新Token\n\n🛡️ 您的密码已安全加密，请放心使用');
+                                }
                             } else {
                                 bot.sendMessage(chatId, '❌ 保存密码失败，但登录已成功');
                             }
@@ -1034,10 +2009,18 @@ bot.onText(/\/login/, (msg) => {
                         bot.removeListener('message', saveHandler);
                     }, 30000);
                 } else {
-                    // 更新已保存的密码
+                    // 该账号已经保存过密码，更新密码
                     saveCredentials(chatId, email, passwd);
-                    userSessions[chatId].hasRememberedPassword = true;
-                    bot.sendMessage(chatId, successMessage + '\n\n🔑 已更新保存的密码');
+                    try {
+                        updateUserSession(chatId, {
+                            hasRememberedPassword: true
+                        }, accountId);
+                    } catch (error) {
+                        console.error('设置hasRememberedPassword失败:', error);
+                    }
+                    // 设置Token刷新定时器
+                    setupTokenRefreshTimer(chatId);
+                    bot.sendMessage(chatId, successMessage + '\n\n🔑 密码已自动更新\n🔄 已启用Token自动刷新');
                 }
             } else {
                 bot.sendMessage(chatId, `❌ 登录失败：${response.msg}`);
@@ -1054,53 +2037,436 @@ bot.onText(/\/login/, (msg) => {
 
 // 注销命令
 bot.onText(/\/logout/, async (msg) => {
-    const token = userTokens[msg.chat.id];
-    if (!token) {
-        bot.sendMessage(msg.chat.id, '❌ 你还没有登录');
+    const currentAccount = getCurrentAccountInfo(msg.chat.id);
+    if (!currentAccount) {
+        bot.sendMessage(msg.chat.id, '❌ 你还没有登录任何账号');
         return;
     }
     
     try {
-        await sendRequest('/logout', { access_token: token });
-        delete userTokens[msg.chat.id];
-        delete userSessions[msg.chat.id];
-        bot.sendMessage(msg.chat.id, '✅ 已成功注销');
+        await sendRequest('/logout', { access_token: currentAccount.token }, null, msg.chat.id);
+        removeAccount(msg.chat.id, currentAccount.accountId);
+        delete tokenLastChecked[msg.chat.id];
+        // 清理持久化页面（已移除Puppeteer）
+        
+        const remainingAccounts = getAccountList(msg.chat.id);
+        if (remainingAccounts.length > 0) {
+            bot.sendMessage(msg.chat.id, `✅ 账号 ${currentAccount.email} 已成功注销\n\n💡 你还有 ${remainingAccounts.length} 个账号，使用 /accounts 查看`);
+        } else {
+            bot.sendMessage(msg.chat.id, '✅ 已成功注销所有账号');
+        }
     } catch (error) {
-        delete userTokens[msg.chat.id];
-        delete userSessions[msg.chat.id];
-        bot.sendMessage(msg.chat.id, '✅ 已成功注销（本地清除）');
+        removeAccount(msg.chat.id, currentAccount.accountId);
+        delete tokenLastChecked[msg.chat.id];
+        // 清理持久化页面（已移除Puppeteer）
+        
+        const remainingAccounts = getAccountList(msg.chat.id);
+        if (remainingAccounts.length > 0) {
+            bot.sendMessage(msg.chat.id, `✅ 账号 ${currentAccount.email} 已成功注销（本地清除）\n\n💡 你还有 ${remainingAccounts.length} 个账号，使用 /accounts 查看`);
+        } else {
+            bot.sendMessage(msg.chat.id, '✅ 已成功注销所有账号（本地清除）');
+        }
     }
 });
 
-// 密码管理命令
-bot.onText(/\/creds/, (msg) => {
+// 账号列表命令
+bot.onText(/\/accounts/, (msg) => {
     const chatId = msg.chat.id;
-    const saved = getSavedCredentials(chatId);
     
-    let credsMessage = `🔑 密码管理中心\n\n`;
+    if (!userAccounts[chatId] || Object.keys(userAccounts[chatId]).length === 0) {
+        bot.sendMessage(chatId, '📋 账号列表\n\n暂无已登录账号\n\n💡 使用 /login 添加第一个账号');
+        return;
+    }
     
-    if (saved) {
-        const maskedEmail = saved.email.replace(/(.{3}).*(@.*)/, '$1***$2');
-        const maskedPassword = '*'.repeat(saved.password.length);
+    const accounts = userAccounts[chatId];
+    const current = currentAccount[chatId];
+    
+    let message = '📋 账号列表\n\n';
+    
+    let buttons = [];
+    
+    Object.entries(accounts).forEach(([accountId, account], index) => {
+        const isCurrent = accountId === current;
+        const status = isCurrent ? '🟢 当前' : '⚪';
+        const loginTime = new Date(account.loginTime).toLocaleString();
+        const lastUsed = new Date(account.lastUsed).toLocaleString();
         
-        credsMessage += `📋 已保存凭据：\n`;
-        credsMessage += `• 邮箱: ${maskedEmail}\n`;
-        credsMessage += `• 密码: ${maskedPassword}\n`;
-        credsMessage += `• 状态: 🟢 已加密保存\n\n`;
+        message += `${index + 1}. ${status} ${account.email}\n`;
+        message += `   🕐 登录: ${loginTime}\n`;
+        message += `   📱 使用: ${lastUsed}\n`;
+        message += `   🆔 ID: ${accountId}\n\n`;
         
-        const session = userSessions[chatId];
-        if (session) {
-            const loginDuration = Math.floor((Date.now() - session.loginTime.getTime()) / 1000 / 60);
-            credsMessage += `🔐 当前会话：\n`;
-            credsMessage += `• 登录邮箱: ${session.email}\n`;
-            credsMessage += `• 登录时长: ${loginDuration}分钟\n`;
-            credsMessage += `• 自动登录: ${session.hasRememberedPassword ? '✅ 启用' : '❌ 禁用'}\n\n`;
+        // 添加按钮
+        let accountButtons = [];
+        if (!isCurrent) {
+            accountButtons.push({
+                text: `🔄 切换到 ${accountId}`,
+                callback_data: `switch_${accountId}`
+            });
+        }
+        accountButtons.push({
+            text: `🗑️ 删除 ${accountId}`,
+            callback_data: `remove_${accountId}`
+        });
+        
+        buttons.push(accountButtons);
+    });
+    
+    // 添加其他操作按钮
+    buttons.push([
+        { text: '➕ 添加新账号', callback_data: 'add_account' },
+        { text: '📍 当前账号详情', callback_data: 'current_account' }
+    ]);
+    
+    message += '🔧 点击按钮进行操作：';
+    
+    bot.sendMessage(chatId, message, {
+        reply_markup: {
+            inline_keyboard: buttons
+        }
+    });
+});
+
+// 处理内联键盘按钮回调
+bot.on('callback_query', async (callbackQuery) => {
+    const msg = callbackQuery.message;
+    const chatId = msg.chat.id;
+    const data = callbackQuery.data;
+    
+    // 应答回调查询
+    bot.answerCallbackQuery(callbackQuery.id);
+    
+    if (data.startsWith('switch_')) {
+        const accountId = data.replace('switch_', '');
+        
+        if (!userAccounts[chatId] || !userAccounts[chatId][accountId]) {
+            bot.sendMessage(chatId, `❌ 账号ID "${accountId}" 不存在`);
+            return;
         }
         
+        if (currentAccount[chatId] === accountId) {
+            const account = userAccounts[chatId][accountId];
+            bot.sendMessage(chatId, `ℹ️ 已经是当前账号: ${account.email}`);
+            return;
+        }
+        
+        if (switchAccount(chatId, accountId)) {
+            const account = userAccounts[chatId][accountId];
+            
+            // 立即验证切换后的账号token是否有效
+            try {
+                const response = await sendRequest('/information', { access_token: account.token }, null, chatId);
+                if (response.ret === 200) {
+                    // Token有效，检查该账号是否有保存的凭据，如果有则设置Token刷新定时器
+                    const savedCreds = getSavedCredentials(chatId, accountId);
+                    if (savedCreds) {
+                        setupTokenRefreshTimer(chatId);
+                        bot.sendMessage(chatId, `✅ 已切换到账号: ${account.email}\n🔄 已启用Token自动刷新`);
+                    } else {
+                        bot.sendMessage(chatId, `✅ 已切换到账号: ${account.email}`);
+                    }
+                } else if (response.ret === 401 || response.ret === 403) {
+                    // Token已过期，尝试自动重新登录
+                    bot.sendMessage(chatId, `⚠️ 已切换到账号: ${account.email}\n\n⏳ Token已过期，正在尝试自动重新登录...`);
+                    
+                    const reloginSuccess = await autoRelogin(chatId, accountId);
+                    if (reloginSuccess) {
+                        bot.sendMessage(chatId, `✅ 自动重新登录成功！\n\n账号 ${account.email} 已可正常使用`);
+                    } else {
+                        bot.sendMessage(chatId, `❌ 自动重新登录失败\n\n请使用 /login 手动重新登录该账号`);
+                    }
+                } else {
+                    // 其他错误码也可能是token问题，尝试自动重新登录
+                    bot.sendMessage(chatId, `⚠️ 已切换到账号: ${account.email}\n\n⏳ 检测到认证问题(${response.ret})，正在尝试自动重新登录...`);
+                    
+                    const reloginSuccess = await autoRelogin(chatId, accountId);
+                    if (reloginSuccess) {
+                        bot.sendMessage(chatId, `✅ 自动重新登录成功！\n\n账号 ${account.email} 已可正常使用`);
+                    } else {
+                        bot.sendMessage(chatId, `❌ 自动重新登录失败\n\n错误信息：${response.msg}\n请使用 /login 手动重新登录该账号`);
+                    }
+                }
+            } catch (error) {
+                console.error('切换账号验证失败:', error.message);
+                
+                // 网络错误时也尝试自动重新登录
+                if (error.response && (error.response.status === 401 || error.response.status === 403)) {
+                    bot.sendMessage(chatId, `⚠️ 已切换到账号: ${account.email}\n\n⏳ 检测到认证失败，正在尝试自动重新登录...`);
+                    
+                    const reloginSuccess = await autoRelogin(chatId, accountId);
+                    if (reloginSuccess) {
+                        bot.sendMessage(chatId, `✅ 自动重新登录成功！\n\n账号 ${account.email} 已可正常使用`);
+                    } else {
+                        bot.sendMessage(chatId, `❌ 自动重新登录失败\n\n请使用 /login 手动重新登录该账号`);
+                    }
+                } else {
+                    bot.sendMessage(chatId, `✅ 已切换到账号: ${account.email}\n\n⚠️ 网络连接失败，请稍后再试`);
+                }
+            }
+        } else {
+            bot.sendMessage(chatId, '❌ 切换账号失败');
+        }
+    } else if (data.startsWith('remove_')) {
+        const accountId = data.replace('remove_', '');
+        
+        if (!userAccounts[chatId] || !userAccounts[chatId][accountId]) {
+            bot.sendMessage(chatId, `❌ 账号ID "${accountId}" 不存在`);
+            return;
+        }
+        
+        const account = userAccounts[chatId][accountId];
+        const email = account.email;
+        
+        if (removeAccount(chatId, accountId)) {
+            const remainingCount = userAccounts[chatId] ? Object.keys(userAccounts[chatId]).length : 0;
+            let message = `✅ 已删除账号: ${email}`;
+            
+            if (remainingCount > 0) {
+                const newCurrent = getCurrentAccountInfo(chatId);
+                message += `\n\n🔄 当前账号已切换为: ${newCurrent.email}`;
+            } else {
+                message += '\n\n📋 已删除所有账号，请使用 /login 重新登录';
+            }
+            
+            bot.sendMessage(chatId, message);
+        } else {
+            bot.sendMessage(chatId, '❌ 删除账号失败');
+        }
+    } else if (data === 'add_account') {
+        bot.sendMessage(chatId, '💡 请使用 /login 命令添加新账号');
+    } else if (data === 'current_account') {
+        const account = getCurrentAccountInfo(chatId);
+        
+        if (!account) {
+            bot.sendMessage(chatId, '❌ 当前无已登录账号\n\n💡 使用 /login 登录账号');
+            return;
+        }
+        
+        const loginTime = new Date(account.loginTime).toLocaleString();
+        const lastUsed = new Date(account.lastUsed).toLocaleString();
+        
+        let message = `📍 当前账号详情\n\n`;
+        message += `📧 邮箱: ${account.email}\n`;
+        message += `🆔 账号ID: ${account.accountId}\n`;
+        message += `🕐 登录时间: ${loginTime}\n`;
+        message += `📱 最后使用: ${lastUsed}\n\n`;
+        message += `🔧 管理操作:\n`;
+        message += `• /accounts - 查看所有账号\n`;
+        message += `• /switch 账号ID - 切换到其他账号\n`;
+        message += `• /login - 添加新账号`;
+        
+        bot.sendMessage(chatId, message);
+    }
+});
+
+// 切换账号命令
+bot.onText(/\/switch(?:\s+(.+))?/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const accountId = match[1]?.trim();
+    
+    if (!accountId) {
+        bot.sendMessage(chatId, '❌ 请指定账号ID\n\n🔍 格式: /switch 账号ID\n💡 使用 /accounts 查看账号列表');
+        return;
+    }
+    
+    if (!userAccounts[chatId] || !userAccounts[chatId][accountId]) {
+        bot.sendMessage(chatId, `❌ 账号ID "${accountId}" 不存在\n\n💡 使用 /accounts 查看可用账号`);
+        return;
+    }
+    
+    if (currentAccount[chatId] === accountId) {
+        const account = userAccounts[chatId][accountId];
+        bot.sendMessage(chatId, `ℹ️ 已经是当前账号: ${account.email}`);
+        return;
+    }
+    
+    if (switchAccount(chatId, accountId)) {
+        const account = userAccounts[chatId][accountId];
+        
+        // 立即验证切换后的账号token是否有效
+        try {
+            const response = await sendRequest('/information', { access_token: account.token }, null, chatId);
+            if (response.ret === 200) {
+                // Token有效，检查该账号是否有保存的凭据，如果有则设置Token刷新定时器
+                const savedCreds = getSavedCredentials(chatId, accountId);
+                if (savedCreds) {
+                    setupTokenRefreshTimer(chatId);
+                    bot.sendMessage(chatId, `✅ 已切换到账号: ${account.email}\n\n📋 账户信息：\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n${formatTraffic(response.data)}\n\n💡 现在所有操作将使用此账号\n🔄 已启用Token自动刷新`);
+                } else {
+                    bot.sendMessage(chatId, `✅ 已切换到账号: ${account.email}\n\n📋 账户信息：\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n${formatTraffic(response.data)}\n\n💡 现在所有操作将使用此账号\n⚠️ 未保存密码，无法自动刷新Token`);
+                }
+            } else if (response.ret === 401 || response.ret === 403) {
+                // Token已过期，尝试自动重新登录
+                bot.sendMessage(chatId, `⚠️ 已切换到账号: ${account.email}\n\n⏳ Token已过期，正在尝试自动重新登录...`);
+                
+                const reloginSuccess = await autoRelogin(chatId, accountId);
+                if (reloginSuccess) {
+                    bot.sendMessage(chatId, `✅ 自动重新登录成功！\n\n账号 ${account.email} 已可正常使用`);
+                } else {
+                    bot.sendMessage(chatId, `❌ 自动重新登录失败\n\n请使用 /login 手动重新登录该账号`);
+                }
+            } else {
+                bot.sendMessage(chatId, `✅ 已切换到账号: ${account.email}\n\n⚠️ 无法验证账号状态：${response.msg}`);
+            }
+        } catch (error) {
+            console.error('切换账号验证失败:', error.message);
+            
+            // 网络错误时也尝试自动重新登录
+            if (error.response && (error.response.status === 401 || error.response.status === 403)) {
+                bot.sendMessage(chatId, `⚠️ 已切换到账号: ${account.email}\n\n⏳ 检测到认证失败，正在尝试自动重新登录...`);
+                
+                const reloginSuccess = await autoRelogin(chatId, accountId);
+                if (reloginSuccess) {
+                    bot.sendMessage(chatId, `✅ 自动重新登录成功！\n\n账号 ${account.email} 已可正常使用`);
+                } else {
+                    bot.sendMessage(chatId, `❌ 自动重新登录失败\n\n请使用 /login 手动重新登录该账号`);
+                }
+            } else {
+                bot.sendMessage(chatId, `✅ 已切换到账号: ${account.email}\n\n⚠️ 网络连接失败，请稍后再试`);
+            }
+        }
+    } else {
+        bot.sendMessage(chatId, '❌ 切换账号失败');
+    }
+});
+
+// 删除账号命令
+bot.onText(/\/remove(?:\s+(.+))?/, (msg, match) => {
+    const chatId = msg.chat.id;
+    const accountId = match[1]?.trim();
+    
+    if (!accountId) {
+        bot.sendMessage(chatId, '❌ 请指定账号ID\n\n🔍 格式: /remove 账号ID\n💡 使用 /accounts 查看账号列表');
+        return;
+    }
+    
+    if (!userAccounts[chatId] || !userAccounts[chatId][accountId]) {
+        bot.sendMessage(chatId, `❌ 账号ID "${accountId}" 不存在\n\n💡 使用 /accounts 查看可用账号`);
+        return;
+    }
+    
+    const account = userAccounts[chatId][accountId];
+    const email = account.email;
+    
+    if (removeAccount(chatId, accountId)) {
+        const remainingCount = userAccounts[chatId] ? Object.keys(userAccounts[chatId]).length : 0;
+        let message = `✅ 已删除账号: ${email}`;
+        
+        if (remainingCount > 0) {
+            const newCurrent = getCurrentAccountInfo(chatId);
+            message += `\n\n🔄 当前账号已切换为: ${newCurrent.email}`;
+        } else {
+            message += '\n\n📋 已删除所有账号，请使用 /login 重新登录';
+        }
+        
+        bot.sendMessage(chatId, message);
+    } else {
+        bot.sendMessage(chatId, '❌ 删除账号失败');
+    }
+});
+
+// 当前账号详情命令
+bot.onText(/\/current/, (msg) => {
+    const chatId = msg.chat.id;
+    const account = getCurrentAccountInfo(chatId);
+    
+    if (!account) {
+        bot.sendMessage(chatId, '❌ 当前无已登录账号\n\n💡 使用 /login 登录账号');
+        return;
+    }
+    
+    const loginTime = new Date(account.loginTime).toLocaleString();
+    const lastUsed = new Date(account.lastUsed).toLocaleString();
+    
+    let message = `🟢 当前账号详情\n\n`;
+    message += `📧 邮箱: ${account.email}\n`;
+    message += `🆔 账号ID: ${account.accountId}\n`;
+    message += `🕐 登录时间: ${loginTime}\n`;
+    message += `📱 最后使用: ${lastUsed}\n\n`;
+    message += `🔧 管理操作:\n`;
+    message += `• /accounts - 查看所有账号\n`;
+    message += `• /switch 账号ID - 切换到其他账号\n`;
+    message += `• /login - 添加新账号`;
+    
+    bot.sendMessage(chatId, message);
+});
+
+// Token失效统计命令
+bot.onText(/\/tokenstats/, (msg) => {
+    const chatId = msg.chat.id;
+    
+    if (tokenFailureLog.length === 0) {
+        bot.sendMessage(chatId, '📊 Token失效统计\n\n暂无失效记录');
+        return;
+    }
+    
+    // 统计分析
+    console.log(`📊 查询Token失效统计 - 用户 ${chatId}, 总记录数: ${tokenFailureLog.length}`);
+    const userLogs = tokenFailureLog.filter(log => String(log.chatId) === String(chatId));
+    const allLogs = tokenFailureLog.slice(-20); // 最近20条
+    
+    let message = '📊 Token失效统计\n\n';
+    
+    if (userLogs.length > 0) {
+        const avgDuration = userLogs.reduce((sum, log) => sum + log.actualDuration, 0) / userLogs.length;
+        const avgTimeToExpiry = userLogs.reduce((sum, log) => sum + Math.abs(log.timeToExpiry), 0) / userLogs.length;
+        
+        message += `👤 您的统计（${userLogs.length}次失效）:\n`;
+        message += `• 平均使用时长: ${avgDuration.toFixed(1)}天\n`;
+        message += `• 平均提前失效: ${avgTimeToExpiry.toFixed(1)}小时\n\n`;
+        
+        message += `📋 最近失效记录:\n`;
+        userLogs.slice(-3).forEach((log, index) => {
+            message += `${index + 1}. ${log.failureTime.toLocaleString()}\n`;
+            message += `   实际${log.actualDuration}天 | ${log.reason}\n`;
+        });
+    } else {
+        message += '👤 您暂无失效记录\n\n';
+    }
+    
+    // 全局统计
+    if (allLogs.length > 0) {
+        const reasonCount = {};
+        allLogs.forEach(log => {
+            reasonCount[log.reason] = (reasonCount[log.reason] || 0) + 1;
+        });
+        
+        message += `\n🌐 全局统计（最近${allLogs.length}次）:\n`;
+        Object.entries(reasonCount).forEach(([reason, count]) => {
+            message += `• ${reason}: ${count}次\n`;
+        });
+    }
+    
+    bot.sendMessage(chatId, message);
+});
+
+// 密码管理命令（多账号模式）
+bot.onText(/\/creds/, (msg) => {
+    const chatId = msg.chat.id;
+    const allCredentials = getAllSavedCredentials(chatId);
+    
+    let credsMessage = `🔑 密码管理中心（多账号模式）\n\n`;
+    
+    if (allCredentials.length > 0) {
+        credsMessage += `📋 已保存凭据 (${allCredentials.length}个账号)：\n\n`;
+        
+        allCredentials.forEach((cred, index) => {
+            const maskedEmail = cred.email.replace(/(.{3}).*(@.*)/, '$1***$2');
+            const maskedPassword = '*'.repeat(cred.password.length);
+            const isCurrentAccount = getCurrentAccountInfo(chatId)?.accountId === cred.accountId;
+            
+            credsMessage += `${index + 1}. ${isCurrentAccount ? '🟢 当前' : '⚪'} ${maskedEmail}\n`;
+            credsMessage += `   📧 邮箱: ${maskedEmail}\n`;
+            credsMessage += `   🔐 密码: ${maskedPassword}\n`;
+            credsMessage += `   🆔 账号ID: ${cred.accountId}\n`;
+            credsMessage += `   📅 保存时间: ${new Date(cred.savedAt).toLocaleString()}\n\n`;
+        });
+        
         credsMessage += `⚙️ 管理选项：\n`;
-        credsMessage += `• 回复 "查看" - 显示明文凭据 ⚠️\n`;
-        credsMessage += `• 回复 "删除" - 删除保存的凭据\n`;
-        credsMessage += `• 回复 "测试" - 测试凭据有效性\n`;
+        credsMessage += `• 回复 "查看 账号ID" - 显示指定账号明文凭据 ⚠️\n`;
+        credsMessage += `• 回复 "删除 账号ID" - 删除指定账号凭据\n`;
+        credsMessage += `• 回复 "测试 账号ID" - 测试指定账号凭据有效性\n`;
+        credsMessage += `• 回复 "全部删除" - 删除所有保存的凭据\n`;
         credsMessage += `• 回复 "取消" - 退出密码管理\n\n`;
         credsMessage += `🔒 安全提示：明文查看仅在私聊中可用`;
     } else {
@@ -1111,7 +2477,7 @@ bot.onText(/\/creds/, (msg) => {
         credsMessage += `• 或使用 /login 重新登录并保存\n\n`;
         credsMessage += `🔐 安全特性：\n`;
         credsMessage += `• AES-256-CBC 加密存储\n`;
-        credsMessage += `• 支持自动重新登录\n`;
+        credsMessage += `• 支持多账号自动重新登录\n`;
         credsMessage += `• 本地加密，安全可靠`;
         
         bot.sendMessage(chatId, credsMessage);
@@ -1124,21 +2490,29 @@ bot.onText(/\/creds/, (msg) => {
     const optionHandler = async (optionMsg) => {
         if (optionMsg.chat.id !== chatId) return;
         
-        const option = optionMsg.text.toLowerCase().trim();
+        const input = optionMsg.text.trim();
+        const parts = input.split(' ');
+        const command = parts[0].toLowerCase();
+        const accountId = parts[1];
         
         try {
             await bot.deleteMessage(chatId, optionMsg.message_id);
         } catch (e) {}
         
-        switch (option) {
+        switch (command) {
             case '查看':
                 if (msg.chat.type !== 'private') {
                     bot.sendMessage(chatId, '⚠️ 为了安全，明文查看仅支持私聊');
                     break;
                 }
-                const currentSavedForView = getSavedCredentials(chatId);
-                if (currentSavedForView) {
-                    const viewMessage = `🔍 凭据详情（明文）：\n\n• 邮箱: \`${currentSavedForView.email}\`\n• 密码: \`${currentSavedForView.password}\`\n\n⚠️ 请立即删除此消息`;
+                if (!accountId) {
+                    bot.sendMessage(chatId, '❌ 请指定账号ID\n\n格式：查看 账号ID');
+                    return;
+                }
+                
+                const savedForView = getSavedCredentials(chatId, accountId);
+                if (savedForView) {
+                    const viewMessage = `🔍 凭据详情（明文）：\n\n• 账号ID: ${accountId}\n• 邮箱: \`${savedForView.email}\`\n• 密码: \`${savedForView.password}\`\n\n⚠️ 请立即删除此消息`;
                     const viewMsg = await bot.sendMessage(chatId, viewMessage, { parse_mode: 'Markdown' });
                     
                     // 30秒后自动删除
@@ -1149,29 +2523,37 @@ bot.onText(/\/creds/, (msg) => {
                         } catch (e) {}
                     }, 30000);
                 } else {
-                    bot.sendMessage(chatId, '❌ 未找到保存的凭据');
+                    bot.sendMessage(chatId, `❌ 未找到账号 ${accountId} 的保存凭据`);
                 }
                 break;
                 
             case '删除':
-                if (deleteSavedCredentials(chatId)) {
-                    delete userSessions[chatId];
-                    delete userTokens[chatId];
-                    bot.sendMessage(chatId, '✅ 已删除保存的凭据和当前会话\n\n💡 下次登录需要重新输入密码');
+                if (!accountId) {
+                    bot.sendMessage(chatId, '❌ 请指定账号ID\n\n格式：删除 账号ID');
+                    return;
+                }
+                
+                if (deleteSavedCredentials(chatId, accountId)) {
+                    bot.sendMessage(chatId, `✅ 已删除账号 ${accountId} 的保存凭据`);
                 } else {
-                    bot.sendMessage(chatId, '❌ 删除凭据失败');
+                    bot.sendMessage(chatId, `❌ 删除账号 ${accountId} 凭据失败`);
                 }
                 break;
                 
             case '测试':
-                const currentSaved = getSavedCredentials(chatId);
-                if (currentSaved) {
+                if (!accountId) {
+                    bot.sendMessage(chatId, '❌ 请指定账号ID\n\n格式：测试 账号ID');
+                    return;
+                }
+                
+                const savedForTest = getSavedCredentials(chatId, accountId);
+                if (savedForTest) {
                     try {
-                        const testMsg = await bot.sendMessage(chatId, '🔄 正在测试凭据有效性...');
+                        const testMsg = await bot.sendMessage(chatId, `🔄 正在测试账号 ${accountId} 的凭据有效性...`);
                         
                         const response = await sendRequest('/login', {
-                            email: currentSaved.email,
-                            passwd: currentSaved.password,
+                            email: savedForTest.email,
+                            passwd: savedForTest.password,
                             token_expire: 30
                         });
                         
@@ -1180,24 +2562,57 @@ bot.onText(/\/creds/, (msg) => {
                         } catch (e) {}
                         
                         if (response.ret === 200) {
-                            // 测试成功，更新当前存储的token
-                            userTokens[chatId] = response.data.token;
-                            userSessions[chatId] = {
-                                email: currentSaved.email,
-                                loginTime: new Date(),
-                                plan: response.data.plan,
-                                hasRememberedPassword: true
-                            };
+                            // 获取正确的token字段（可能是token或access_token）
+                            const token = response.data.token || response.data.access_token;
+                            if (!token) {
+                                bot.sendMessage(chatId, `❌ 账号 ${accountId} 凭据测试失败\n\n错误：服务器响应格式错误，未返回token`);
+                                return;
+                            }
                             
-                            bot.sendMessage(chatId, '✅ 凭据测试成功\n\n• 邮箱和密码有效\n• 可以正常登录\n• 自动重新登录功能正常\n• 已更新登录状态');
+                            // 测试成功，更新该账号的token
+                            if (userAccounts[chatId] && userAccounts[chatId][accountId]) {
+                                const tokenExpiry = response.data.token_expire && response.data.token_expire !== '9999-99-99 99:99:99' 
+                                    ? new Date(response.data.token_expire).getTime() 
+                                    : Date.now() + (30 * 24 * 60 * 60 * 1000);
+                                
+                                userAccounts[chatId][accountId].token = token;
+                                userAccounts[chatId][accountId].tokenExpire = tokenExpiry;
+                                userAccounts[chatId][accountId].lastUsed = Date.now();
+                                
+                                // 如果是当前账号，保存token到文件
+                                if (currentAccount[chatId] === accountId) {
+                                    saveTokenToFile(chatId, accountId, {
+                                        token: token,
+                                        tokenExpire: tokenExpiry,
+                                        email: userAccounts[chatId][accountId].email
+                                    });
+                                    
+                                    updateUserSession(chatId, {
+                                        email: savedForTest.email,
+                                        loginTime: new Date(),
+                                        plan: response.data.plan,
+                                        hasRememberedPassword: true
+                                    }, accountId);
+                                }
+                            }
+                            
+                            bot.sendMessage(chatId, `✅ 账号 ${accountId} 凭据测试成功\n\n• 邮箱: ${savedForTest.email}\n• 密码有效\n• 可以正常登录\n• 自动重新登录功能正常\n• 已更新登录状态`);
                         } else {
-                            bot.sendMessage(chatId, `❌ 凭据测试失败\n\n错误信息：${response.msg}\n\n💡 建议删除当前凭据并重新登录`);
+                            bot.sendMessage(chatId, `❌ 账号 ${accountId} 凭据测试失败\n\n错误信息：${response.msg}\n\n💡 建议删除该账号凭据并重新登录`);
                         }
                     } catch (error) {
-                        bot.sendMessage(chatId, '❌ 凭据测试失败，请检查网络连接');
+                        bot.sendMessage(chatId, `❌ 账号 ${accountId} 凭据测试失败，请检查网络连接`);
                     }
                 } else {
-                    bot.sendMessage(chatId, '❌ 未找到保存的凭据');
+                    bot.sendMessage(chatId, `❌ 未找到账号 ${accountId} 的保存凭据`);
+                }
+                break;
+                
+            case '全部删除':
+                if (deleteSavedCredentials(chatId)) {
+                    bot.sendMessage(chatId, '✅ 已删除所有保存的凭据\n\n💡 下次登录需要重新输入密码');
+                } else {
+                    bot.sendMessage(chatId, '❌ 删除凭据失败');
                 }
                 break;
                 
@@ -1206,7 +2621,7 @@ bot.onText(/\/creds/, (msg) => {
                 break;
                 
             default:
-                bot.sendMessage(chatId, '❌ 无效选项，请回复：查看、删除、测试、取消');
+                bot.sendMessage(chatId, '❌ 无效选项，请回复：\n• 查看 账号ID\n• 删除 账号ID\n• 测试 账号ID\n• 全部删除\n• 取消');
                 return; // 不移除监听器，等待有效输入
         }
         
@@ -1223,18 +2638,29 @@ bot.onText(/\/creds/, (msg) => {
 
 // 用户信息命令
 bot.onText(/\/info/, requireLogin(async (msg) => {
-    const token = userTokens[msg.chat.id];
+    const chatId = msg.chat.id;
+    const currentAccount = getCurrentAccountInfo(chatId);
     
     try {
-        const response = await sendRequest('/information', { access_token: token });
+        const response = await sendRequest('/information', { access_token: currentAccount.token }, null, chatId);
         if (response.ret === 200) {
-            const session = userSessions[msg.chat.id];
-            let info = `📋 账户信息：\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n• 推广余额：¥${response.data.aff_money}\n${formatTraffic(response.data)}`;
+            let info = `📋 当前账户信息：\n🆔 账号ID：${currentAccount.accountId}\n📧 邮箱：${currentAccount.email}\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n• 推广余额：¥${response.data.aff_money}\n${formatTraffic(response.data)}`;
             
-            if (session) {
-                const loginDuration = Math.floor((Date.now() - session.loginTime.getTime()) / 1000 / 60);
-                const passwordStatus = session.hasRememberedPassword ? '🔐 已保存，支持自动登录' : '🔒 未保存';
-                info += `\n🔐 会话信息：\n• 登录邮箱：${session.email}\n• 登录时长：${loginDuration}分钟\n• 密码状态：${passwordStatus}`;
+            if (currentAccount.loginTime) {
+                const loginTime = currentAccount.loginTime instanceof Date ? currentAccount.loginTime : new Date(currentAccount.loginTime);
+                const loginDuration = Math.floor((Date.now() - loginTime.getTime()) / 1000 / 60);
+                
+                // 显示token过期时间
+                const tokenExpiry = currentAccount.tokenExpiry;
+                const tokenStatus = tokenExpiry ? 
+                    `🕐 Token过期时间：${new Date(tokenExpiry).toLocaleString()}` : 
+                    '🕐 Token过期时间：未知';
+                
+                info += `\n🔐 会话信息：\n• 登录时长：${loginDuration}分钟\n• ${tokenStatus}`;
+                
+                // 显示账号总数
+                const totalAccounts = getAccountList(msg.chat.id).length;
+                info += `\n\n💡 账号管理：\n• 总账号数：${totalAccounts}\n• 使用 /accounts 查看所有账号\n• 使用 /switch 账号ID 切换账号`;
             }
             
             bot.sendMessage(msg.chat.id, info);
@@ -1242,16 +2668,18 @@ bot.onText(/\/info/, requireLogin(async (msg) => {
             bot.sendMessage(msg.chat.id, `❌ 获取信息失败：${response.msg}`);
         }
     } catch (error) {
-        bot.sendMessage(msg.chat.id, '❌ 获取信息失败，请检查网络连接');
+        console.error('❌ /info 命令失败:', error.message);
+        bot.sendMessage(msg.chat.id, '❌ 获取信息失败，请检查网络连接\n\n💡 提示：如果刚切换账号，可能需要重新登录');
     }
 }));
 
 // 签到命令
 bot.onText(/\/checkin/, requireLogin(async (msg) => {
-    const token = userTokens[msg.chat.id];
+    const chatId = msg.chat.id;
+    const currentAccount = getCurrentAccountInfo(chatId);
     
     try {
-        const response = await sendRequest('/checkin', { access_token: token });
+        const response = await sendRequest('/checkin', { access_token: currentAccount.token }, null, chatId);
         if (response.ret === 200) {
             const checkinInfo = `🎉 ${response.data.checkin}\n${formatTraffic(response.data)}`;
             bot.sendMessage(msg.chat.id, checkinInfo);
@@ -1265,10 +2693,11 @@ bot.onText(/\/checkin/, requireLogin(async (msg) => {
 
 // 订阅命令
 bot.onText(/\/sub/, requireLogin(async (msg) => {
-    const token = userTokens[msg.chat.id];
+    const chatId = msg.chat.id;
+    const currentAccount = getCurrentAccountInfo(chatId);
     
     try {
-        const response = await sendRequest('/managed/clash', { access_token: token });
+        const response = await sendRequest('/managed/clash', { access_token: currentAccount.token }, null, chatId);
         if (response.ret === 200) {
             const subscriptions = `
 📱 全部订阅链接：
@@ -1303,13 +2732,13 @@ cat >> bot.js << 'EOF'
 
 // 优化的查看节点命令
 bot.onText(/\/nodes/, requireLogin(async (msg) => {
-    const token = userTokens[msg.chat.id];
+    const currentAccount = getCurrentAccountInfo(msg.chat.id);
     
     try {
         const progressMsg = await bot.sendMessage(msg.chat.id, '🔍 正在获取节点信息...');
         
-        const nodesResponse = await sendRequest('/nodes/list', { access_token: token });
-        const rulesResponse = await sendRequest('/nodes/cusrelay/getrules', { access_token: token });
+        const nodesResponse = await sendRequest('/nodes/list', { access_token: currentAccount.token }, null, msg.chat.id);
+        const rulesResponse = await sendRequest('/nodes/cusrelay/getrules', { access_token: currentAccount.token }, null, msg.chat.id);
         
         try {
             await bot.deleteMessage(msg.chat.id, progressMsg.message_id);
@@ -1391,10 +2820,11 @@ bot.onText(/\/nodes/, requireLogin(async (msg) => {
 
 // 查看转发规则
 bot.onText(/\/getrules/, requireLogin(async (msg) => {
-    const token = userTokens[msg.chat.id];
+    const chatId = msg.chat.id;
+    const currentAccount = getCurrentAccountInfo(chatId);
     
     try {
-        const response = await sendRequest('/nodes/cusrelay/getrules', { access_token: token });
+        const response = await sendRequest('/nodes/cusrelay/getrules', { access_token: currentAccount.token }, null, chatId);
         if (response.ret === 200) {
             if (response.data.length === 0) {
                 bot.sendMessage(msg.chat.id, '📋 当前没有外部转发规则\n\n💡 使用 /addrule 添加新规则\n\n🔍 格式：/addrule 节点ID 目标IP 目标端口 [协议一致]');
@@ -1438,7 +2868,8 @@ bot.onText(/\/addrule/, requireLogin(async (msg) => {
         return;
     }
     
-    const token = userTokens[msg.chat.id];
+    const chatId = msg.chat.id;
+    const currentAccount = getCurrentAccountInfo(chatId);
     
     const text = msg.text.trim();
     const parts = text.split(' ');
@@ -1490,7 +2921,7 @@ bot.onText(/\/addrule/, requireLogin(async (msg) => {
         // 验证节点ID是否有效
         let selectedNodeName = '';
         try {
-            const nodesResponse = await sendRequest('/nodes/list', { access_token: token });
+            const nodesResponse = await sendRequest('/nodes/list', { access_token: currentAccount.token }, null, chatId);
             if (nodesResponse.ret === 200) {
                 const validNodeIds = nodesResponse.data.map(node => node.node_id);
                 if (!validNodeIds.includes(node_id)) {
@@ -1510,7 +2941,7 @@ bot.onText(/\/addrule/, requireLogin(async (msg) => {
         
         // 使用正确的字符串格式（根据调试结果）
         const requestData = {
-            access_token: token,
+            access_token: currentAccount.token,
             node_id: String(node_id),
             target_host: String(target_host),
             target_port: String(target_port),
@@ -1568,7 +2999,7 @@ bot.onText(/\/delrule/, requireLogin(async (msg) => {
         return;
     }
     
-    const token = userTokens[msg.chat.id];
+    const currentAccount = getCurrentAccountInfo(msg.chat.id);
     
     const text = msg.text.trim();
     const parts = text.split(' ');
@@ -1594,7 +3025,7 @@ bot.onText(/\/delrule/, requireLogin(async (msg) => {
         const progressMsg = await bot.sendMessage(msg.chat.id, '🔄 正在删除转发规则...');
         
         const response = await sendRequest('/nodes/cusrelay/del', {
-            access_token: token,
+            access_token: currentAccount.token,
             rule_id: Number(rule_id)
         });
         
@@ -1652,12 +3083,13 @@ process.on('uncaughtException', (error) => {
 });
 
 // 优雅关闭
-const gracefulShutdown = () => {
+const gracefulShutdown = async () => {
     console.log('\n🛑 正在优雅关闭机器人...');
-    console.log('📊 当前会话数:', Object.keys(userTokens).length);
+    console.log('📊 当前会话数:', getActiveUsersFromFile().length);
+    
+    // 关闭浏览器实例（已移除Puppeteer）
     
     // 清理资源
-    userTokens = {};
     userSessions = {};
     
     bot.stopPolling();
@@ -1691,6 +3123,10 @@ const startBot = async () => {
         } else {
             console.log('⚠️ 网络连接异常');
         }
+        
+        // 启动时加载所有数据
+        loadAllTokens();
+        loadAllSessions();
         
         // 启动定时检测token功能
         startTokenMonitoring();
