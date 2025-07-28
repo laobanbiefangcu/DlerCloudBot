@@ -1716,9 +1716,6 @@ const setupBotMenu = async () => {
             { command: 'login', description: '🔐 登录墙洞账户' },
             { command: 'logout', description: '🚪 注销当前账号' },
             { command: 'accounts', description: '👥 查看所有账号' },
-            { command: 'switch', description: '🔄 切换账号' },
-            { command: 'current', description: '📍 查看当前账号' },
-            { command: 'remove', description: '🗑️ 删除账号' },
             { command: 'creds', description: '🔑 密码管理' },
             { command: 'tokenstats', description: '📊 Token失效统计' },
             { command: 'info', description: '📊 查看账户信息' },
@@ -1988,6 +1985,13 @@ bot.onText(/\/login/, (msg) => {
                     plan: response.data.plan,
                     hasRememberedPassword: false
                 }, accountId);
+                
+                // 保存token到文件
+                saveTokenToFile(chatId, accountId, {
+                    token: token,
+                    tokenExpire: tokenExpiry,
+                    email: email
+                });
                 
                 const successMessage = `✅ 登录成功！\n\n📋 账户信息：\n• 账号ID：${accountId}\n• 邮箱：${email}\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}\n\n💡 使用 /accounts 查看所有账号\n💡 使用 /switch ${accountId} 切换账号`;
                 
@@ -2615,21 +2619,19 @@ bot.onText(/\/creds/, (msg) => {
                                     tokenExpiryTimes[chatId] = tokenExpiry;
                                 }
                                 
-                                // 如果是当前账号，保存token到文件
-                                if (currentAccount[chatId] === accountId) {
-                                    saveTokenToFile(chatId, accountId, {
-                                        token: token,
-                                        tokenExpire: tokenExpiry,
-                                        email: userAccounts[chatId][accountId].email
-                                    });
+                                // 保存token到文件（所有账号都保存）
+                                saveTokenToFile(chatId, accountId, {
+                                    token: token,
+                                    tokenExpire: tokenExpiry,
+                                    email: userAccounts[chatId][accountId].email
+                                });
                                     
-                                    updateUserSession(chatId, {
-                                        email: savedForTest.email,
-                                        loginTime: new Date(),
-                                        plan: response.data.plan,
-                                        hasRememberedPassword: true
-                                    }, accountId);
-                                }
+                                updateUserSession(chatId, {
+                                    email: savedForTest.email,
+                                    loginTime: new Date(),
+                                    plan: response.data.plan,
+                                    hasRememberedPassword: true
+                                }, accountId);
                             }
                             
                             bot.sendMessage(chatId, `✅ 账号 ${accountId} 凭据测试成功\n\n• 邮箱: ${savedForTest.email}\n• 密码有效\n• 可以正常登录\n• 自动重新登录功能正常\n• 已更新登录状态`);
