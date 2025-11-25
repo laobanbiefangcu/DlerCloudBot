@@ -3,9 +3,12 @@
 # 墙洞API Telegram Bot 完整最终部署脚本
 # 作者: Dler Bot Team
 # 版本: v1.0.5 - 最终修复版
-# 使用方法: bash dler.sh
+# 使用方法: bash dlerbot.sh
 
-set -e
+set -euo pipefail
+
+OS=""
+OS_NAME=""
 
 # 设置时区为中国标准时间
 export TZ=Asia/Shanghai
@@ -48,6 +51,45 @@ log_cyan() {
     echo -e "${CYAN}[TEST]${NC} $1"
 }
 
+npm_global_install() {
+    local package="$1"
+
+    if npm list -g "$package" --depth=0 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if npm install -g "$package" >/dev/null 2>&1; then
+        hash -r 2>/dev/null || true
+        return 0
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        log_warn "需要sudo权限安装全局npm包 $package，尝试使用sudo..."
+        if sudo npm install -g "$package" >/dev/null 2>&1; then
+            hash -r 2>/dev/null || true
+            return 0
+        fi
+    fi
+
+    local npm_prefix="$HOME/.npm-global"
+    log_warn "使用用户级npm前缀: $npm_prefix"
+    mkdir -p "$npm_prefix/bin"
+    npm config set prefix "$npm_prefix" >/dev/null 2>&1
+    if [[ ":$PATH:" != *":$npm_prefix/bin:"* ]]; then
+        export PATH="$npm_prefix/bin:$PATH"
+    fi
+
+    if npm install -g "$package" >/dev/null 2>&1; then
+        hash -r 2>/dev/null || true
+        log_info "npm包 $package 已安装到 $npm_prefix"
+        log_info "如需永久生效，请将 'export PATH=\"$npm_prefix/bin:\$PATH\"' 添加到shell配置"
+        return 0
+    fi
+
+    log_error "安装全局npm包 $package 失败，请手动检查npm权限"
+    exit 1
+}
+
 # 检查是否为root用户
 check_root() {
     if [[ $EUID -eq 0 ]]; then
@@ -63,38 +105,92 @@ check_root() {
 
 # 检测系统类型
 detect_os() {
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        OS_NAME="${PRETTY_NAME:-${NAME:-}}"
+        case "${ID,,}" in
+            ubuntu|debian)
+                OS="debian"
+                log_info "检测到系统: ${OS_NAME:-$ID}"
+                return
+                ;;
+            centos|rhel|rocky|almalinux)
+                OS="centos"
+                log_info "检测到系统: ${OS_NAME:-$ID}"
+                return
+                ;;
+        esac
+        if [[ -n "${ID_LIKE:-}" ]]; then
+            case "${ID_LIKE,,}" in
+                *debian*)
+                    OS="debian"
+                    log_info "检测到系统: ${OS_NAME:-${ID:-unknown}}"
+                    return
+                    ;;
+                *rhel*|*centos*|*fedora*)
+                    OS="centos"
+                    log_info "检测到系统: ${OS_NAME:-${ID:-unknown}}"
+                    return
+                    ;;
+            esac
+        fi
+    fi
+
     if [[ -f /etc/redhat-release ]]; then
         OS="centos"
+        OS_NAME="$(head -n1 /etc/redhat-release)"
     elif [[ -f /etc/debian_version ]]; then
         OS="debian"
+        OS_NAME="Debian $(cat /etc/debian_version)"
     else
         log_error "不支持的操作系统"
         exit 1
     fi
-    log_info "检测到系统: $OS"
+    log_info "检测到系统: ${OS_NAME:-$OS}"
 }
 
 # 检查网络连接
 check_network() {
     log_blue "检查网络连接..."
-    if ! ping -c 1 8.8.8.8 >/dev/null 2>&1; then
-        log_error "网络连接失败，请检查网络设置"
+    local targets=("https://dler.cloud" "https://api.telegram.org" "https://www.cloudflare.com")
+    local success=false
+
+    for target in "${targets[@]}"; do
+        if curl -fsS --connect-timeout 5 --max-time 10 --head "$target" >/dev/null 2>&1; then
+            log_info "网络连接正常: $target"
+            success=true
+            break
+        else
+            log_warn "无法连接: $target"
+        fi
+    done
+
+    if [[ $success == false ]]; then
+        log_error "网络检测失败，请检查网络或防火墙设置"
         exit 1
     fi
-    log_info "网络连接正常"
 }
 
 # 检查磁盘空间
 check_disk_space() {
     log_blue "检查磁盘空间..."
-    available_space=$(df / | awk 'NR==2 {print $4}')
-    required_space=100000  # 100MB in KB
-    
-    if [[ $available_space -lt $required_space ]]; then
-        log_error "磁盘空间不足，需要至少100MB"
+    local target_dir="${HOME:-/}"
+    local required_space=$((100 * 1024)) # 100MB in KB
+    local available_space
+
+    available_space=$(df -Pk "$target_dir" | awk 'NR==2 {print $4}')
+
+    if [[ -z ${available_space:-} ]]; then
+        log_warn "无法获取磁盘空间信息，跳过检查"
+        return
+    fi
+
+    if (( available_space < required_space )); then
+        log_error "磁盘空间不足，需要至少100MB，当前可用: $((available_space / 1024))MB"
         exit 1
     fi
-    log_info "磁盘空间检查通过"
+    log_info "磁盘空间检查通过 (可用 $((available_space / 1024))MB)"
 }
 
 # 检查权限
@@ -154,12 +250,20 @@ install_nodejs() {
 
 # 安装PM2
 install_pm2() {
-    if ! command -v pm2 &> /dev/null; then
-        log_blue "安装PM2进程管理器..."
-        npm install -g pm2
-        log_info "PM2安装完成"
-    else
+    if command -v pm2 &> /dev/null; then
         log_info "PM2已安装: $(pm2 --version)"
+        return
+    fi
+
+    log_blue "安装PM2进程管理器..."
+    npm_global_install pm2
+    hash -r 2>/dev/null || true
+    if command -v pm2 &> /dev/null; then
+        log_info "PM2安装完成: $(pm2 --version)"
+    else
+        log_warn "PM2安装完成，但当前会话尚未检测到pm2命令。"
+        log_warn "请确保PATH包含npm全局目录，或在当前shell中执行:"
+        log_warn "  export PATH=\"$HOME/.npm-global/bin:\$PATH\""
     fi
 }
 
@@ -209,7 +313,9 @@ cat > package.json << 'EOF'
   "dependencies": {
     "node-telegram-bot-api": "^0.64.0",
     "undici": "^6.10.0",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "node-cron": "^3.0.3",
+    "request": "^2.88.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
@@ -334,6 +440,103 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
 const DLER_BASE_URL = process.env.DLER_BASE_URL || 'https://dler.cloud/api/v1';
 const DEBUG = process.env.DEBUG === 'true';
 
+const DLER_BASE_ORIGIN = (() => {
+    try {
+        return new URL(DLER_BASE_URL).origin;
+    } catch (_error) {
+        return DLER_BASE_URL.replace(/\/api\/v1$/, '');
+    }
+})();
+
+const SURGE_LEVEL_BASE = '2|3|4|5|6';
+
+const normalizeSuffix = (suffix) => {
+    if (!suffix) {
+        return null;
+    }
+    return suffix.startsWith('.') ? suffix : `.${suffix}`;
+};
+
+const getSubscriptionSuffix = (url, preferredSuffix) => {
+    const candidates = [];
+
+    if (url) {
+        try {
+            const parsed = new URL(url);
+            const lastSegment = parsed.pathname.split('/').pop() || '';
+            const extFromPath = path.extname(lastSegment);
+            if (extFromPath) {
+                candidates.push(extFromPath);
+            }
+
+            const lvParam = parsed.searchParams.get('lv');
+            if (lvParam) {
+                const dotIndex = lvParam.lastIndexOf('.');
+                if (dotIndex !== -1) {
+                    candidates.push(lvParam.slice(dotIndex));
+                }
+            }
+
+            const typeParam = parsed.searchParams.get('type');
+            if (typeParam) {
+                const extFromType = path.extname(typeParam);
+                if (extFromType) {
+                    candidates.push(extFromType);
+                }
+            }
+
+            for (const value of parsed.searchParams.values()) {
+                const extFromValue = path.extname(value);
+                if (extFromValue) {
+                    candidates.push(extFromValue);
+                }
+            }
+        } catch (_error) {}
+
+        const tokenMatch = url.match(/download\.getFile\/([^?]+)/);
+        if (tokenMatch) {
+            const extFromToken = path.extname(tokenMatch[1]);
+            if (extFromToken) {
+                candidates.push(extFromToken);
+            }
+        }
+    }
+
+    const normalizedPreferred = normalizeSuffix(preferredSuffix);
+    if (normalizedPreferred) {
+        candidates.push(normalizedPreferred);
+    }
+
+    return candidates.find(Boolean) || '';
+};
+
+const buildSurgeQuery = (suffix = '') => {
+    const normalizedSuffix = normalizeSuffix(suffix) || '';
+    const encodedLv = encodeURIComponent(`${SURGE_LEVEL_BASE}${normalizedSuffix}`);
+    return `protocols=ss2022&provider=surge&lv=${encodedLv}`;
+};
+
+const buildSurgeSubscriptionLink = (url, preferredSuffix) => {
+    if (!url) {
+        return null;
+    }
+
+    let origin = DLER_BASE_ORIGIN;
+    try {
+        origin = new URL(url).origin;
+    } catch (_error) {}
+
+    const tokenMatch = url.match(/download\.getFile\/([^?]+)/);
+    if (!tokenMatch) {
+        return url;
+    }
+
+    const suffix = getSubscriptionSuffix(url, preferredSuffix);
+    const query = buildSurgeQuery(suffix);
+
+    return `${origin}/api/v3/download.getFile/${tokenMatch[1]}?${query}`;
+};
+
 // 检查配置
 if (!BOT_TOKEN || !ADMIN_USER_ID) {
     console.error('❌ 请先配置环境变量 BOT_TOKEN 和 ADMIN_USER_ID');
@@ -378,6 +581,13 @@ const addAccount = (chatId, email, token, tokenExpire) => {
         loginTime: Date.now(),
         lastUsed: Date.now()
     };
+    
+    // 保存token到文件
+    saveTokenToFile(chatId, accountId, {
+        token: token,
+        tokenExpire: tokenExpire,
+        email: email
+    });
     
     // 如果是第一个账号，设为当前账号
     if (!currentAccount[chatId]) {
@@ -1423,8 +1633,14 @@ const startTokenMonitoring = () => {
 
 // 中间件：检查登录状态和Token有效性
 const requireLogin = (callback) => {
-    return async (msg) => {
-        const chatId = msg.chat.id;
+    return async (msg, match) => {
+        // 处理回调查询的情况
+        const chatId = msg.message ? msg.message.chat.id : (msg.chat ? msg.chat.id : null);
+        
+        if (!chatId) {
+            console.error('无法获取chatId:', msg);
+            return;
+        }
         
         // 首先检查是否有当前账号
         const currentAccount = getCurrentAccountInfo(chatId);
@@ -1451,7 +1667,7 @@ const requireLogin = (callback) => {
         // 确保当前账号存在后再执行回调
         const finalAccount = getCurrentAccountInfo(chatId);
         if (finalAccount && finalAccount.token) {
-            callback(msg);
+            callback(msg, match);
         } else {
             bot.sendMessage(chatId, '❌ 登录状态异常，请使用 /login 重新登录');
         }
@@ -1724,7 +1940,9 @@ const setupBotMenu = async () => {
             { command: 'nodes', description: '🌐 查看可用节点' },
             { command: 'getrules', description: '📋 查看转发规则' },
             { command: 'addrule', description: '➕ 添加转发规则' },
-            { command: 'delrule', description: '➖ 删除转发规则' }
+            { command: 'delrule', description: '➖ 删除转发规则' },
+            { command: 'cron_manage', description: '⏰ 管理定时任务' },
+            { command: 'subscription_status', description: '📊 查看订阅状态' }
         ]);
         console.log('✅ 机器人菜单设置完成');
     } catch (error) {
@@ -1985,13 +2203,6 @@ bot.onText(/\/login/, (msg) => {
                     plan: response.data.plan,
                     hasRememberedPassword: false
                 }, accountId);
-                
-                // 保存token到文件
-                saveTokenToFile(chatId, accountId, {
-                    token: token,
-                    tokenExpire: tokenExpiry,
-                    email: email
-                });
                 
                 const successMessage = `✅ 登录成功！\n\n📋 账户信息：\n• 账号ID：${accountId}\n• 邮箱：${email}\n• 套餐：${response.data.plan}\n• 到期时间：${response.data.plan_time}\n• 余额：¥${response.data.money}\n${formatTraffic(response.data)}\n\n💡 使用 /accounts 查看所有账号\n💡 使用 /switch ${accountId} 切换账号`;
                 
@@ -2291,6 +2502,254 @@ bot.on('callback_query', async (callbackQuery) => {
         message += `• /login - 添加新账号`;
         
         bot.sendMessage(chatId, message);
+    } else if (data.startsWith('cron_')) {
+        // 处理定时任务相关按钮
+        const action = data.replace('cron_', '');
+        
+        switch (action) {
+            case 'start':
+                if (subscriptionCronJob) {
+                    bot.sendMessage(chatId, '⚠️ 定时任务已经在运行中');
+                    return;
+                }
+                
+                try {
+                    // 每2小时的第3分钟执行
+                    subscriptionCronJob = cron.schedule('3 */2 * * *', async () => {
+                        console.log('🕐 定时任务开始执行订阅更新...');
+                        try {
+                            const dependencies = { getAccountList, userAccounts, sendRequest };
+                            const result = await subscriptionManager.processAllSubscriptions(dependencies);
+                            console.log(`✅ 定时任务完成: ${result.message}`);
+                            
+                            // 可选：发送通知给管理员
+                            if (process.env.ADMIN_USER_ID) {
+                                bot.sendMessage(process.env.ADMIN_USER_ID, 
+                                    `🤖 定时任务完成\n${result.message}\n⏰ ${new Date().toLocaleString()}`
+                                );
+                            }
+                        } catch (error) {
+                            console.error('❌ 定时任务执行失败:', error.message);
+                            if (process.env.ADMIN_USER_ID) {
+                                bot.sendMessage(process.env.ADMIN_USER_ID, 
+                                    `❌ 定时任务失败\n${error.message}\n⏰ ${new Date().toLocaleString()}`
+                                );
+                            }
+                        }
+                    }, {
+                        scheduled: false
+                    });
+                    
+                    subscriptionCronJob.start();
+                    bot.sendMessage(chatId, '✅ 定时任务已启动\n⏰ 将每2小时自动更新订阅');
+                    
+                } catch (error) {
+                    bot.sendMessage(chatId, `❌ 启动定时任务失败: ${error.message}`);
+                }
+                break;
+                
+            case 'stop':
+                if (!subscriptionCronJob) {
+                    bot.sendMessage(chatId, '⚠️ 定时任务未在运行');
+                    return;
+                }
+                
+                subscriptionCronJob.stop();
+                subscriptionCronJob.destroy();
+                subscriptionCronJob = null;
+                bot.sendMessage(chatId, '⏹️ 定时任务已停止');
+                break;
+                
+            case 'status':
+                const status = subscriptionCronJob ? '▶️ 运行中' : '⏹️ 已停止';
+                const nextRun = subscriptionCronJob ? '下次执行: 每2小时的第3分钟' : '无';
+                
+                bot.sendMessage(chatId, 
+                    `📊 定时任务状态\n\n` +
+                    `🎯 当前状态: ${status}\n` +
+                    `⏰ 执行频率: 每2小时执行一次\n` +
+                    `📅 ${nextRun}\n\n` +
+                    `💡 使用 /cron_manage 重新打开管理面板`
+                );
+                break;
+                
+            case 'update':
+                try {
+                    bot.sendMessage(chatId, '🔄 正在手动更新订阅...');
+                    const dependencies = { getAccountList, userAccounts, sendRequest };
+                    const result = await subscriptionManager.processAllSubscriptions(dependencies);
+                    bot.sendMessage(chatId, `✅ 手动更新完成\n${result.message}`);
+                } catch (error) {
+                    console.error('手动更新订阅失败:', error.message);
+                    bot.sendMessage(chatId, `❌ 手动更新失败: ${error.message}`);
+                }
+                break;
+                
+            case 'refresh':
+                // 重新发送cron_manage界面
+                let currentStatus = '⏹️ 已停止';
+                if (subscriptionCronJob) {
+                    currentStatus = '▶️ 运行中 (每2小时执行一次)';
+                }
+                
+                const message = `📋 定时任务状态\n\n` +
+                               `🎯 当前状态: ${currentStatus}\n\n` +
+                               `🔧 管理命令:\n` +
+                               `• /cron_manage start - 启动定时任务\n` +
+                               `• /cron_manage stop - 停止定时任务\n` +
+                               `• /cron_manage status - 查看状态\n` +
+                               `• /update_subscriptions - 手动更新`;
+
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { 
+                                text: subscriptionCronJob ? '⏹️ 停止任务' : '▶️ 启动任务', 
+                                callback_data: subscriptionCronJob ? 'cron_stop' : 'cron_start' 
+                            },
+                            { text: '📊 查看状态', callback_data: 'cron_status' }
+                        ],
+                        [
+                            { text: '🔄 手动更新', callback_data: 'cron_update' },
+                            { text: '🔄 刷新', callback_data: 'cron_refresh' }
+                        ]
+                    ]
+                };
+                
+                bot.sendMessage(chatId, message, { reply_markup: keyboard });
+                break;
+                
+            default:
+                bot.sendMessage(chatId, '❌ 未知操作');
+        }
+    } else if (data.startsWith('sub_')) {
+        // 处理订阅状态相关按钮
+        const action = data.replace('sub_', '');
+        
+        switch (action) {
+            case 'refresh':
+                // 刷新订阅状态
+                try {
+                    const fs = require('fs');
+                    const path = require('path');
+                    
+                    const destinationDir = '/home/nginx/web/';
+                    const files = ['dler', 'dler1'];
+                    
+                    let message = '📋 订阅文件状态\n\n';
+                    
+                    for (const filename of files) {
+                        const filePath = path.join(destinationDir, filename);
+                        
+                        if (fs.existsSync(filePath)) {
+                            const stats = fs.statSync(filePath);
+                            const size = (stats.size / 1024).toFixed(2);
+                            const modTime = stats.mtime.toLocaleString();
+                            
+                            message += `📄 ${filename}\n`;
+                            message += `   📏 大小: ${size} KB\n`;
+                            message += `   🕐 更新: ${modTime}\n\n`;
+                        } else {
+                            message += `📄 ${filename}\n`;
+                            message += `   ❌ 文件不存在\n\n`;
+                        }
+                    }
+                    
+                    const cronStatus = subscriptionCronJob ? '▶️ 运行中' : '⏹️ 已停止';
+                    message += `🤖 定时任务: ${cronStatus}`;
+
+                    const keyboard = {
+                        inline_keyboard: [
+                            [
+                                { text: '🔄 刷新状态', callback_data: 'sub_refresh' },
+                                { text: '📊 定时任务', callback_data: 'sub_cron_status' }
+                            ],
+                            [
+                                { text: '🔄 手动更新', callback_data: 'sub_update' },
+                                { text: '📝 查看日志', callback_data: 'sub_logs' }
+                            ]
+                        ]
+                    };
+                    
+                    bot.sendMessage(chatId, message, { reply_markup: keyboard });
+                } catch (error) {
+                    bot.sendMessage(chatId, `❌ 刷新状态失败: ${error.message}`);
+                }
+                break;
+                
+            case 'cron_status':
+                // 显示定时任务详细状态
+                const status = subscriptionCronJob ? '▶️ 运行中' : '⏹️ 已停止';
+                const nextRun = subscriptionCronJob ? '下次执行: 每2小时的第3分钟' : '无';
+                
+                bot.sendMessage(chatId, 
+                    `📊 定时任务详细状态\n\n` +
+                    `🎯 当前状态: ${status}\n` +
+                    `⏰ 执行频率: 每2小时执行一次\n` +
+                    `📅 ${nextRun}\n\n` +
+                    `💡 使用 /cron_manage 管理定时任务`
+                );
+                break;
+                
+            case 'update':
+                // 手动更新订阅
+                try {
+                    bot.sendMessage(chatId, '🔄 正在手动更新订阅...');
+                    const dependencies = { getAccountList, userAccounts, sendRequest };
+                    const result = await subscriptionManager.processAllSubscriptions(dependencies);
+                    bot.sendMessage(chatId, `✅ 手动更新完成\n${result.message}`);
+                } catch (error) {
+                    console.error('手动更新订阅失败:', error.message);
+                    bot.sendMessage(chatId, `❌ 手动更新失败: ${error.message}`);
+                }
+                break;
+                
+            case 'logs':
+                // 查看最近的日志
+                try {
+                    const fs = require('fs');
+                    const logPath = '/root/dler-cloud-bot/logs/out.log';
+                    
+                    if (fs.existsSync(logPath)) {
+                        const logContent = fs.readFileSync(logPath, 'utf8');
+                        const lines = logContent.split('\n').filter(line => line.trim());
+                        const recentLines = lines.slice(-20); // 最近20行
+                        
+                        let logMessage = '📝 最近日志 (最后20条)\n\n';
+                        recentLines.forEach((line, index) => {
+                            try {
+                                const logData = JSON.parse(line);
+                                if (logData.message) {
+                                    // 只显示消息内容，去掉换行符
+                                    const cleanMessage = logData.message.replace(/\n/g, ' ').trim();
+                                    if (cleanMessage) {
+                                        logMessage += `${index + 1}. ${cleanMessage}\n`;
+                                    }
+                                }
+                            } catch (e) {
+                                // 如果不是JSON格式，直接显示
+                                if (line.trim()) {
+                                    logMessage += `${index + 1}. ${line.trim()}\n`;
+                                }
+                            }
+                        });
+                        
+                        if (logMessage.length > 4000) {
+                            logMessage = logMessage.substring(0, 3900) + '\n\n... (日志过长，已截断)';
+                        }
+                        
+                        bot.sendMessage(chatId, logMessage);
+                    } else {
+                        bot.sendMessage(chatId, '❌ 日志文件不存在');
+                    }
+                } catch (error) {
+                    bot.sendMessage(chatId, `❌ 查看日志失败: ${error.message}`);
+                }
+                break;
+                
+            default:
+                bot.sendMessage(chatId, '❌ 未知订阅操作');
+        }
     }
 });
 
@@ -2619,19 +3078,21 @@ bot.onText(/\/creds/, (msg) => {
                                     tokenExpiryTimes[chatId] = tokenExpiry;
                                 }
                                 
-                                // 保存token到文件（所有账号都保存）
-                                saveTokenToFile(chatId, accountId, {
-                                    token: token,
-                                    tokenExpire: tokenExpiry,
-                                    email: userAccounts[chatId][accountId].email
-                                });
+                                // 如果是当前账号，保存token到文件
+                                if (currentAccount[chatId] === accountId) {
+                                    saveTokenToFile(chatId, accountId, {
+                                        token: token,
+                                        tokenExpire: tokenExpiry,
+                                        email: userAccounts[chatId][accountId].email
+                                    });
                                     
-                                updateUserSession(chatId, {
-                                    email: savedForTest.email,
-                                    loginTime: new Date(),
-                                    plan: response.data.plan,
-                                    hasRememberedPassword: true
-                                }, accountId);
+                                    updateUserSession(chatId, {
+                                        email: savedForTest.email,
+                                        loginTime: new Date(),
+                                        plan: response.data.plan,
+                                        hasRememberedPassword: true
+                                    }, accountId);
+                                }
                             }
                             
                             bot.sendMessage(chatId, `✅ 账号 ${accountId} 凭据测试成功\n\n• 邮箱: ${savedForTest.email}\n• 密码有效\n• 可以正常登录\n• 自动重新登录功能正常\n• 已更新登录状态`);
@@ -2735,29 +3196,39 @@ bot.onText(/\/sub/, requireLogin(async (msg) => {
     const currentAccount = getCurrentAccountInfo(chatId);
     
     try {
-        const response = await sendRequest('/managed/clash', { access_token: currentAccount.token }, null, chatId);
-        if (response.ret === 200) {
-            const subscriptions = `
-📱 全部订阅链接：
+        const response = await sendRequest('/managed/surge', { access_token: currentAccount.token }, null, chatId);
 
-🔗 Smart: \`${response.smart}\`
+        const payload = (response && typeof response.data === 'object'
+            && (response.data.surge || response.data.smart || response.data.ss2022))
+            ? response.data
+            : response;
 
-🔗 SS: \`${response.ss}\`
+        const statusCode = typeof response.ret === 'number'
+            ? response.ret
+            : (typeof response.code === 'number' ? response.code : undefined);
 
-🔗 VMess: \`${response.vmess}\`
-
-🔗 Trojan: \`${response.trojan}\`
-
-🔗 SS2022: \`${response.ss2022}\`
-
-📝 配置文件名：${response.name}
-
-💡 点击链接可直接复制
-`;
-            bot.sendMessage(msg.chat.id, subscriptions, { parse_mode: 'Markdown' });
-        } else {
-            bot.sendMessage(msg.chat.id, `❌ 获取订阅失败：${response.msg}`);
+        const preferredSuffix = path.extname(payload?.name || '') || null;
+        const surgeLink = buildSurgeSubscriptionLink(payload?.surge || payload?.ss2022 || payload?.smart, preferredSuffix);
+        const hasLinks = payload && (payload.smart || payload.ss2022 || payload.surge || surgeLink);
+        if ((statusCode !== undefined && statusCode !== 200) || !hasLinks) {
+            const errorMessage = response.msg || response.message || (hasLinks ? '未知错误' : '未返回订阅链接');
+            bot.sendMessage(msg.chat.id, `❌ 获取订阅失败：${errorMessage}`);
+            return;
         }
+
+        const lines = ['📱 全部订阅链接：', ''];
+        if (payload.smart) {
+            lines.push(`🔗 Smart: \`${payload.smart}\``, '');
+        }
+        if (surgeLink) {
+            lines.push(`🔗 SS2022: \`${surgeLink}\``, '');
+        } else if (payload.ss2022) {
+            lines.push(`🔗 SS2022: \`${payload.ss2022}\``, '');
+        }
+
+        lines.push(`📝 配置文件名：${payload.name || '未命名'}`, '', '💡 点击链接可直接复制');
+        const subscriptions = `${lines.join('\n')}\n`;
+        bot.sendMessage(msg.chat.id, subscriptions, { parse_mode: 'Markdown' });
     } catch (error) {
         bot.sendMessage(msg.chat.id, '❌ 获取订阅失败，请检查网络连接');
     }
@@ -3183,16 +3654,658 @@ EOF
     log_info "机器人主程序创建完成"
 }
 
+# 创建机器人主程序 - 第7部分（订阅管理）
+create_bot_js_part7() {
+cat >> bot.js << 'EOF'
+
+// 引入订阅管理模块
+const subscriptionManager = require('./subscription_manager.js');
+const cron = require('node-cron');
+
+// 定时任务状态
+let subscriptionCronJob = null;
+
+// 手动触发订阅更新
+bot.onText(/\/update_subscriptions/, requireLogin(async (msg) => {
+    const chatId = msg.chat.id;
+    
+    try {
+        const progressMsg = await bot.sendMessage(chatId, '🔄 开始更新订阅文件...');
+        
+        const dependencies = { getAccountList, userAccounts, sendRequest, chatId };
+        const result = await subscriptionManager.processAllSubscriptions(dependencies);
+        
+        await bot.editMessageText(
+            `✅ ${result.message}\n\n🕐 处理时间: ${new Date().toLocaleString()}`,
+            {
+                chat_id: chatId,
+                message_id: progressMsg.message_id
+            }
+        );
+        
+    } catch (error) {
+        console.error('更新订阅失败:', error.message);
+        bot.sendMessage(chatId, `❌ 更新订阅失败: ${error.message}`);
+    }
+}));
+
+// 管理定时任务
+bot.onText(/\/cron_manage(?:\s+(.+))?/, requireLogin(async (msg, match) => {
+    const chatId = msg.chat.id;
+    const action = match && match[1] ? match[1].trim() : null;
+    
+    if (!action) {
+        let status = '⏹️ 已停止';
+        let statusIcon = '⏹️';
+        if (subscriptionCronJob) {
+            status = '▶️ 运行中 (每2小时执行一次)';
+            statusIcon = '▶️';
+        }
+        
+        const message = `📋 定时任务状态\n\n` +
+                       `🎯 当前状态: ${status}\n\n` +
+                       `🔧 管理命令:\n` +
+                       `• /cron_manage start - 启动定时任务\n` +
+                       `• /cron_manage stop - 停止定时任务\n` +
+                       `• /cron_manage status - 查看状态\n` +
+                       `• /update_subscriptions - 手动更新`;
+
+        // 创建内联键盘按钮
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { 
+                        text: subscriptionCronJob ? '⏹️ 停止任务' : '▶️ 启动任务', 
+                        callback_data: subscriptionCronJob ? 'cron_stop' : 'cron_start' 
+                    },
+                    { text: '📊 查看状态', callback_data: 'cron_status' }
+                ],
+                [
+                    { text: '🔄 手动更新', callback_data: 'cron_update' },
+                    { text: '🔄 刷新', callback_data: 'cron_refresh' }
+                ]
+            ]
+        };
+        
+        bot.sendMessage(chatId, message, { reply_markup: keyboard });
+        return;
+    }
+    
+    switch (action.toLowerCase()) {
+        case 'start':
+            if (subscriptionCronJob) {
+                bot.sendMessage(chatId, '⚠️ 定时任务已经在运行中');
+                return;
+            }
+            
+            try {
+                // 每2小时的第3分钟执行
+                subscriptionCronJob = cron.schedule('3 */2 * * *', async () => {
+                    console.log('🕐 定时任务开始执行订阅更新...');
+                    try {
+                        const dependencies = { getAccountList, userAccounts, sendRequest };
+                        const result = await subscriptionManager.processAllSubscriptions(dependencies);
+                        console.log(`✅ 定时任务完成: ${result.message}`);
+                        
+                        // 可选：发送通知给管理员
+                        if (process.env.ADMIN_USER_ID) {
+                            bot.sendMessage(process.env.ADMIN_USER_ID, 
+                                `🤖 定时任务完成\n${result.message}\n⏰ ${new Date().toLocaleString()}`
+                            );
+                        }
+                    } catch (error) {
+                        console.error('❌ 定时任务执行失败:', error.message);
+                        if (process.env.ADMIN_USER_ID) {
+                            bot.sendMessage(process.env.ADMIN_USER_ID, 
+                                `❌ 定时任务失败\n${error.message}\n⏰ ${new Date().toLocaleString()}`
+                            );
+                        }
+                    }
+                }, {
+                    scheduled: false
+                });
+                
+                subscriptionCronJob.start();
+                bot.sendMessage(chatId, '✅ 定时任务已启动\n⏰ 将每2小时自动更新订阅');
+                
+            } catch (error) {
+                bot.sendMessage(chatId, `❌ 启动定时任务失败: ${error.message}`);
+            }
+            break;
+            
+        case 'stop':
+            if (!subscriptionCronJob) {
+                bot.sendMessage(chatId, '⚠️ 定时任务未在运行');
+                return;
+            }
+            
+            subscriptionCronJob.stop();
+            subscriptionCronJob.destroy();
+            subscriptionCronJob = null;
+            bot.sendMessage(chatId, '⏹️ 定时任务已停止');
+            break;
+            
+        case 'status':
+            const status = subscriptionCronJob ? '▶️ 运行中' : '⏹️ 已停止';
+            const nextRun = subscriptionCronJob ? '下次执行: 每2小时的第3分钟' : '无';
+            
+            bot.sendMessage(chatId, 
+                `📊 定时任务状态\n\n` +
+                `🎯 状态: ${status}\n` +
+                `⏰ 计划: ${nextRun}\n` +
+                `📁 目标目录: /home/nginx/web/\n` +
+                `📋 处理账号: 2个`
+            );
+            break;
+            
+        default:
+            bot.sendMessage(chatId, '❌ 未知操作，请使用: start, stop, status');
+    }
+}));
+
+// 查看订阅文件状态
+bot.onText(/\/subscription_status/, requireLogin(async (msg) => {
+    const chatId = msg.chat.id;
+    
+    try {
+        const fs = require('fs');
+        const path = require('path');
+        
+        const destinationDir = '/home/nginx/web/';
+        const files = ['dler', 'dler1'];
+        
+        let message = '📋 订阅文件状态\n\n';
+        
+        for (const filename of files) {
+            const filePath = path.join(destinationDir, filename);
+            
+            if (fs.existsSync(filePath)) {
+                const stats = fs.statSync(filePath);
+                const size = (stats.size / 1024).toFixed(2);
+                const modTime = stats.mtime.toLocaleString();
+                
+                message += `📄 ${filename}\n`;
+                message += `   📏 大小: ${size} KB\n`;
+                message += `   🕐 更新: ${modTime}\n\n`;
+            } else {
+                message += `📄 ${filename}\n`;
+                message += `   ❌ 文件不存在\n\n`;
+            }
+        }
+        
+        const cronStatus = subscriptionCronJob ? '▶️ 运行中' : '⏹️ 已停止';
+        message += `🤖 定时任务: ${cronStatus}`;
+
+        // 创建内联键盘按钮
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    { text: '🔄 刷新状态', callback_data: 'sub_refresh' },
+                    { text: '📊 定时任务', callback_data: 'sub_cron_status' }
+                ],
+                [
+                    { text: '🔄 手动更新', callback_data: 'sub_update' },
+                    { text: '📝 查看日志', callback_data: 'sub_logs' }
+                ]
+            ]
+        };
+        
+        bot.sendMessage(chatId, message, { reply_markup: keyboard });
+        
+    } catch (error) {
+        bot.sendMessage(chatId, `❌ 获取状态失败: ${error.message}`);
+    }
+}));
+
+EOF
+}
+
+# 创建订阅管理模块
+create_subscription_manager() {
+    log_blue "创建订阅管理模块..."
+    
+cat > subscription_manager.js << 'EOF'
+const fs = require('fs');
+const path = require('path');
+const request = require('request');
+
+const SURGE_LEVEL_BASE = '2|3|4|5|6';
+
+const normalizeSuffix = (suffix) => {
+    if (!suffix) {
+        return null;
+    }
+    return suffix.startsWith('.') ? suffix : `.${suffix}`;
+};
+
+const getSubscriptionSuffix = (url, preferredSuffix) => {
+    const candidates = [];
+
+    if (url) {
+        try {
+            const parsed = new URL(url);
+            const lastSegment = parsed.pathname.split('/').pop() || '';
+            const extFromPath = path.extname(lastSegment);
+            if (extFromPath) {
+                candidates.push(extFromPath);
+            }
+
+            const lvParam = parsed.searchParams.get('lv');
+            if (lvParam) {
+                const dotIndex = lvParam.lastIndexOf('.');
+                if (dotIndex !== -1) {
+                    candidates.push(lvParam.slice(dotIndex));
+                }
+            }
+
+            const typeParam = parsed.searchParams.get('type');
+            if (typeParam) {
+                const extFromType = path.extname(typeParam);
+                if (extFromType) {
+                    candidates.push(extFromType);
+                }
+            }
+
+            for (const value of parsed.searchParams.values()) {
+                const extFromValue = path.extname(value);
+                if (extFromValue) {
+                    candidates.push(extFromValue);
+                }
+            }
+        } catch (_error) {}
+
+        const tokenMatch = url.match(/download\.getFile\/([^?]+)/);
+        if (tokenMatch) {
+            const extFromToken = path.extname(tokenMatch[1]);
+            if (extFromToken) {
+                candidates.push(extFromToken);
+            }
+        }
+    }
+
+    const normalizedPreferred = normalizeSuffix(preferredSuffix);
+    if (normalizedPreferred) {
+        candidates.push(normalizedPreferred);
+    }
+
+    return candidates.find(Boolean) || '';
+};
+
+const buildSurgeQuery = (suffix = '') => {
+    const normalizedSuffix = normalizeSuffix(suffix) || '';
+    const encodedLv = encodeURIComponent(`${SURGE_LEVEL_BASE}${normalizedSuffix}`);
+    return `protocols=ss2022&provider=surge&lv=${encodedLv}`;
+};
+
+const normalizeSubscriptionUrl = (fallbackBaseUrl, url, preferredSuffix) => {
+    if (!url) {
+        return null;
+    }
+
+    let origin = fallbackBaseUrl;
+    try {
+        origin = new URL(url).origin;
+    } catch (_error) {}
+
+    const tokenMatch = url.match(/download\.getFile\/([^?]+)/);
+    if (!tokenMatch) {
+        return url;
+    }
+
+    const suffix = getSubscriptionSuffix(url, preferredSuffix);
+    const query = buildSurgeQuery(suffix);
+
+    return `${origin}/api/v3/download.getFile/${tokenMatch[1]}?${query}`;
+};
+
+// 节点排序优先级配置
+const priority = {
+    "AC": 6,
+    "Ultra": 5,
+    "Pro": 4,
+    "Std": 3,
+    "Max": 5,
+    "Plus": 4,
+    "Air": 1
+};
+
+const countryPriority = {
+    "香港": 1,
+    "台湾": 2,
+    "新加坡": 3,
+    "日本": 4,
+    "韩国": 5,
+    "美国": 6,
+    "俄罗斯": 7,
+    "加拿大": 8,
+    "印度": 9,
+    "土耳其": 10,
+    "尼日利亚": 11,
+    "巴西": 12,
+    "德国": 13,
+    "法国": 14,
+    "泰国": 15,
+    "澳大利亚": 16,
+    "英国": 17,
+    "菲律宾": 18,
+    "阿根廷": 19,
+    "马来西亚": 20
+};
+
+// 获取节点优先级
+function getPriority(node) {
+    for (const [level, prio] of Object.entries(priority)) {
+        if (node.includes(`[${level}]`)) {
+            return prio;
+        }
+    }
+    return 0;
+}
+
+// 获取国家优先级
+function getCountryPriority(node) {
+    for (const [country, prio] of Object.entries(countryPriority)) {
+        if (node.includes(country)) {
+            return prio;
+        }
+    }
+    return 100;
+}
+
+// 分组排序并重新编号
+function groupSortAndRenumber(nodes) {
+    const groupedNodes = {};
+    
+    // 按国家分组
+    for (const node of nodes) {
+        for (const country of Object.keys(countryPriority)) {
+            if (node.includes(country)) {
+                if (!groupedNodes[country]) {
+                    groupedNodes[country] = [];
+                }
+                groupedNodes[country].push(node);
+                break;
+            }
+        }
+    }
+    
+    // 按国家优先级排序
+    const sortedGroups = Object.entries(groupedNodes).sort(
+        ([a], [b]) => countryPriority[a] - countryPriority[b]
+    );
+    
+    const sortedNodes = [];
+    for (const [country, countryNodes] of sortedGroups) {
+        // 按节点优先级排序
+        const sortedCountryNodes = countryNodes.sort((a, b) => getPriority(b) - getPriority(a));
+        
+        // 重新编号
+        for (let i = 0; i < sortedCountryNodes.length; i++) {
+            const newNumber = `[${String(i + 1).padStart(2, '0')}]`;
+            sortedCountryNodes[i] = sortedCountryNodes[i].replace(/\[\d+\]/, newNumber);
+        }
+        
+        sortedNodes.push(...sortedCountryNodes);
+    }
+    
+    return sortedNodes;
+}
+
+// 下载订阅文件
+async function downloadSubscription(url, filename) {
+    return new Promise((resolve, reject) => {
+        console.log(`🔄 开始下载订阅: ${url}`);
+        
+        const options = {
+            url: url,
+            timeout: 30000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+            }
+        };
+        
+        request(options, (error, response, body) => {
+            if (error) {
+                reject(new Error(`下载失败: ${error.message}`));
+                return;
+            }
+            
+            if (response.statusCode !== 200) {
+                reject(new Error(`下载失败，状态码: ${response.statusCode}`));
+                return;
+            }
+            
+            if (!body || body.length === 0) {
+                reject(new Error('下载内容为空'));
+                return;
+            }
+            
+            try {
+                fs.writeFileSync(filename, body);
+                const fileSize = fs.statSync(filename).size;
+                console.log(`✅ 订阅下载成功: ${filename} (${fileSize} bytes)`);
+                resolve();
+            } catch (writeError) {
+                reject(new Error(`文件写入失败: ${writeError.message}`));
+            }
+        });
+    });
+}
+
+// 排序节点
+function sortNodes(filePath) {
+    try {
+        if (!fs.existsSync(filePath)) {
+            throw new Error(`文件不存在: ${filePath}`);
+        }
+        
+        const fileSize = fs.statSync(filePath).size;
+        if (fileSize === 0) {
+            throw new Error(`文件为空: ${filePath}`);
+        }
+        
+        console.log(`🔄 开始处理文件: ${filePath} (${fileSize} bytes)`);
+        
+        const content = fs.readFileSync(filePath, 'utf8');
+        const lines = content.split('\n');
+        
+        if (lines.length === 0) {
+            throw new Error('文件内容为空');
+        }
+        
+        const header = lines[0].trim() === 'proxies:' ? lines[0] + '\n' : '';
+        const nodes = header ? lines.slice(1) : lines;
+        
+        if (nodes.length === 0) {
+            throw new Error('没有找到节点数据');
+        }
+        
+        const sortedNodes = groupSortAndRenumber(nodes);
+        const finalContent = header + sortedNodes.join('\n');
+        
+        fs.writeFileSync(filePath, finalContent);
+        console.log(`✅ 节点排序完成: ${filePath}`);
+        
+    } catch (error) {
+        console.error(`❌ 排序节点失败: ${error.message}`);
+        throw error;
+    }
+}
+
+// 复制文件到目标位置
+function copyToDestination(src, dst) {
+    try {
+        if (!fs.existsSync(src)) {
+            throw new Error(`源文件不存在: ${src}`);
+        }
+        
+        const srcSize = fs.statSync(src).size;
+        if (srcSize === 0) {
+            throw new Error(`源文件为空: ${src}`);
+        }
+        
+        // 确保目标目录存在
+        const dstDir = path.dirname(dst);
+        if (!fs.existsSync(dstDir)) {
+            fs.mkdirSync(dstDir, { recursive: true });
+        }
+        
+        fs.copyFileSync(src, dst);
+        
+        const dstSize = fs.statSync(dst).size;
+        if (dstSize !== srcSize) {
+            throw new Error(`复制后文件大小不匹配: 源文件${srcSize}bytes，目标文件${dstSize}bytes`);
+        }
+        
+        console.log(`✅ 文件复制成功: ${dst} (${dstSize} bytes)`);
+        
+    } catch (error) {
+        console.error(`❌ 复制文件失败: ${error.message}`);
+        throw error;
+    }
+}
+
+// 处理单个账号的订阅
+async function processAccountSubscription(baseUrl, account, tempDir, destinationDir, dependencies = {}) {
+    try {
+        console.log(`🔄 开始处理账号: ${account.email}`);
+        
+        const { getAccountList, userAccounts, sendRequest, chatId } = dependencies;
+        
+        // 获取当前所有已登录账号
+        let matchingAccount = null;
+        
+        if (chatId && getAccountList) {
+            const allAccounts = getAccountList(chatId);
+            matchingAccount = allAccounts.find(acc => acc.email === account.email);
+        } else if (getAccountList && userAccounts) {
+            // 定时任务场景：查找所有用户中的匹配账号
+            for (const userId of Object.keys(userAccounts)) {
+                const accounts = getAccountList(userId);
+                const found = accounts.find(acc => acc.email === account.email);
+                if (found) {
+                    matchingAccount = found;
+                    break;
+                }
+            }
+        } else {
+            throw new Error('缺少必要的依赖函数');
+        }
+        
+        if (!matchingAccount || !matchingAccount.token) {
+            throw new Error(`账号 ${account.email} 未登录或token无效`);
+        }
+        
+        // 获取订阅链接
+        const response = await sendRequest('/managed/surge', {
+            access_token: matchingAccount.token
+        }, null, chatId);
+
+        const payload = (response && typeof response.data === 'object'
+            && (response.data.surge || response.data.ss2022 || response.data.smart))
+            ? response.data
+            : response;
+
+        const statusCode = typeof response.ret === 'number'
+            ? response.ret
+            : (typeof response.code === 'number' ? response.code : undefined);
+
+        const hasLinks = payload && (payload.surge || payload.ss2022 || payload.smart);
+        if ((statusCode !== undefined && statusCode !== 200) || !hasLinks) {
+            const errorMessage = response.msg || response.message || (hasLinks ? '未知错误' : '未找到订阅链接');
+            throw new Error(`获取订阅链接失败: ${errorMessage}`);
+        }
+
+        const rawUrl = payload.surge || payload.ss2022 || payload.smart;
+        if (!rawUrl) {
+            throw new Error('API返回为空，未找到SS订阅链接');
+        }
+
+        const preferredSuffix = path.extname(payload?.name || '') || null;
+        const downloadUrl = normalizeSubscriptionUrl(baseUrl, rawUrl, preferredSuffix);
+
+        console.log(`✅ 获取订阅链接成功: ${account.email}`);
+        
+        // 下载订阅文件
+        const tempFile = path.join(tempDir, account.filename);
+        await downloadSubscription(downloadUrl, tempFile);
+        
+        // 排序节点
+        sortNodes(tempFile);
+        
+        // 复制到目标目录
+        const destFile = path.join(destinationDir, account.filename);
+        copyToDestination(tempFile, destFile);
+        
+        console.log(`✅ 账号 ${account.email} 处理完成`);
+        return true;
+        
+    } catch (error) {
+        console.error(`❌ 处理账号 ${account.email} 失败: ${error.message}`);
+        return false;
+    }
+}
+
+// 批量处理所有账号订阅
+async function processAllSubscriptions(dependencies = {}) {
+    const tempDir = '/home/test';
+    const destinationDir = '/home/nginx/web/';
+    
+    // 确保目录存在
+    if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+    }
+    if (!fs.existsSync(destinationDir)) {
+        fs.mkdirSync(destinationDir, { recursive: true });
+    }
+    
+    const baseUrl = 'https://dler.cloud';
+    const accounts = [
+        { email: 'conbbyn@gmail.com', filename: 'dler' },
+        { email: 'laobanbiefangcu@gmail.com', filename: 'dler1' }
+    ];
+    
+    let successCount = 0;
+    let totalCount = accounts.length;
+    
+    for (const account of accounts) {
+        const success = await processAccountSubscription(baseUrl, account, tempDir, destinationDir, dependencies);
+        if (success) {
+            successCount++;
+        }
+    }
+    
+    return {
+        success: successCount,
+        total: totalCount,
+        message: `订阅处理完成：成功 ${successCount}/${totalCount} 个账号`
+    };
+}
+
+module.exports = {
+    processAllSubscriptions,
+    processAccountSubscription,
+    downloadSubscription,
+    sortNodes,
+    copyToDestination
+};
+EOF
+
+    log_info "订阅管理模块创建完成"
+}
+
 # 组合创建完整的bot.js
 create_complete_bot_js() {
     log_blue "创建完整的机器人程序..."
     
+    create_subscription_manager
     create_bot_js_part1
     create_bot_js_part2
     create_bot_js_part3
     create_bot_js_part4
     create_bot_js_part5
     create_bot_js_part6
+    create_bot_js_part7
     
     log_info "✅ 完整机器人程序创建完成"
 }
@@ -3260,7 +4373,30 @@ case $choice in
             echo "🗑️  删除服务: pm2 delete dler-bot"
         else
             echo "❌ PM2未安装，正在安装..."
-            npm install -g pm2
+    if npm install -g pm2 >/dev/null 2>&1; then
+        hash -r 2>/dev/null || true
+            elif command -v sudo >/dev/null 2>&1; then
+                echo "⚠️ 需要sudo权限安装PM2，尝试使用sudo..."
+                sudo npm install -g pm2 >/dev/null 2>&1 || {
+                    echo "❌ PM2安装失败，请检查npm权限"
+                    exit 1
+                }
+                hash -r 2>/dev/null || true
+            else
+                NPM_PREFIX="$HOME/.npm-global"
+                echo "⚠️ 使用用户级npm前缀: $NPM_PREFIX"
+                mkdir -p "$NPM_PREFIX/bin"
+                npm config set prefix "$NPM_PREFIX" >/dev/null 2>&1
+                if [[ ":$PATH:" != *":$NPM_PREFIX/bin:"* ]]; then
+                    export PATH="$NPM_PREFIX/bin:$PATH"
+                fi
+                npm install -g pm2 >/dev/null 2>&1 || {
+                    echo "❌ PM2安装失败，请检查npm权限"
+                    exit 1
+                }
+                echo "ℹ️ 请将 'export PATH=\"$NPM_PREFIX/bin:\$PATH\"' 添加到你的shell配置文件"
+                hash -r 2>/dev/null || true
+            fi
             npm run pm2:start
         fi
         ;;
@@ -3377,7 +4513,30 @@ fi
 # 确保PM2已安装
 if ! command -v pm2 &> /dev/null; then
     echo "📦 安装PM2..."
-    npm install -g pm2
+    if npm install -g pm2 >/dev/null 2>&1; then
+        hash -r 2>/dev/null || true
+    elif command -v sudo >/dev/null 2>&1; then
+        echo "⚠️ 需要sudo权限安装PM2，尝试使用sudo..."
+        sudo npm install -g pm2 >/dev/null 2>&1 || {
+            echo "❌ PM2安装失败，请检查npm权限"
+            exit 1
+        }
+        hash -r 2>/dev/null || true
+    else
+        NPM_PREFIX="$HOME/.npm-global"
+        echo "⚠️ 使用用户级npm前缀: $NPM_PREFIX"
+        mkdir -p "$NPM_PREFIX/bin"
+        npm config set prefix "$NPM_PREFIX" >/dev/null 2>&1
+        if [[ ":$PATH:" != *":$NPM_PREFIX/bin:"* ]]; then
+            export PATH="$NPM_PREFIX/bin:$PATH"
+        fi
+        npm install -g pm2 >/dev/null 2>&1 || {
+            echo "❌ PM2安装失败，请检查npm权限"
+            exit 1
+        }
+        echo "ℹ️ 请将 'export PATH=\"$NPM_PREFIX/bin:\$PATH\"' 添加到你的shell配置文件"
+        hash -r 2>/dev/null || true
+    fi
 fi
 
 # 启动或重启
@@ -3615,12 +4774,50 @@ if [[ -f package.json ]] && grep -q "dler-cloud-telegram-bot" package.json; then
     rm -f start.sh quick-start.sh stop.sh status.sh uninstall.sh
     rm -f dler-bot.service
     rm -f README.md
+    rm -f subscription_manager.js
+    rm -f test.js
     rm -rf logs/
     
     log_info "✅ 项目文件已删除"
 else
     log_warn "⚠️ 未找到项目文件或项目标识不匹配"
 fi
+
+# 清理机器人相关的crontab任务
+echo ""
+log_info "清理定时任务..."
+
+if crontab -l 2>/dev/null | grep -q "downloads.py\|subscription"; then
+    log_warn "发现相关的定时任务"
+    
+    # 备份当前crontab
+    crontab -l > crontab_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null
+    
+    # 移除相关任务
+    crontab -l 2>/dev/null | grep -v "downloads.py\|subscription" | crontab -
+    log_info "✅ 相关定时任务已清理"
+    log_info "📋 原crontab已备份"
+else
+    log_info "✅ 未发现相关定时任务"
+fi
+
+# 清理可能残留的旧脚本文件
+echo ""
+log_info "清理可能的残留文件..."
+
+CLEANUP_FILES=(
+    "/root/downloads.py"
+    "/root/downloads.py.backup.*"
+    "/tmp/dler_shared_token.json"
+    "/home/test/downloads.log"
+)
+
+for file_pattern in "${CLEANUP_FILES[@]}"; do
+    if ls $file_pattern 2>/dev/null; then
+        rm -f $file_pattern
+        log_info "✅ 已清理: $file_pattern"
+    fi
+done
 
 # 4. 询问是否删除整个目录
 echo ""
@@ -3668,8 +4865,17 @@ echo "✅ 停止所有机器人进程"
 echo "✅ 删除PM2配置"
 echo "✅ 删除systemd服务"
 echo "✅ 删除项目文件"
+echo "✅ 清理subscription_manager.js"
+echo "✅ 清理相关定时任务"
+echo "✅ 清理downloads.py残留文件"
+echo "✅ 清理共享token文件"
 echo ""
 log_info "感谢使用墙洞Telegram Bot v1.0.5！"
+echo ""
+echo "💡 提示："
+echo "• 所有机器人文件和配置已清理"
+echo "• 订阅管理功能相关文件已删除" 
+echo "• 如有crontab备份文件，请检查是否需要保留"
 EOF
     
     chmod +x uninstall.sh
@@ -3888,7 +5094,7 @@ show_usage() {
     echo ""
     echo "功能模块:"
     echo "  🔐 账户管理 (登录/注销/信息/签到)"
-    echo "  📱 订阅获取 (Smart/SS/VMess/Trojan/SS2022)"
+    echo "  📱 订阅获取 (Smart/SS2022)"
     echo "  🌐 节点管理 (查看真实节点列表)"
     echo "  🔄 转发管理 (添加/查看/删除规则)"
     echo "  📊 状态监控 (系统/网络/API健康检查)"
